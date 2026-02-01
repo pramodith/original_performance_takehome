@@ -83,7 +83,11 @@ class KernelBuilder:
         # Simple slot packing that just uses one slot per instruction bundle
         instrs = []
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            if engine == "bundle":
+                # Pre-packed bundle, pass through directly
+                instrs.append(slot)
+            else:
+                instrs.append({engine: [slot]})
         return instrs
 
     def add(self, engine, slot):
@@ -176,10 +180,7 @@ class KernelBuilder:
             batch_size: Number of parallel traversals in each batch.
             rounds: Number of traversal rounds to perform.
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+        # Scratch space addresses for init vars
         init_vars = [
             "rounds",
             "n_nodes",
@@ -191,9 +192,10 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
+        tmp_init = self.alloc_scratch("tmp_init")
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            self.add("load", ("const", tmp_init, i))
+            self.add("load", ("load", self.scratch[v], tmp_init))
 
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
@@ -209,48 +211,160 @@ class KernelBuilder:
 
         body = []  # array of slots
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        # Allocate scratch register arrays for bundling
+        # Size based on the bottleneck operation (load/store with limit 2)
+        bundle_size = SLOT_LIMITS["load"]  # Use load limit as bundle size
+
+        # Allocate arrays of scratch registers for bundled operations
+        tmp_idx = [self.alloc_scratch(f"tmp_idx_{j}") for j in range(bundle_size)]
+        tmp_val = [self.alloc_scratch(f"tmp_val_{j}") for j in range(bundle_size)]
+        tmp_node_val = [self.alloc_scratch(f"tmp_node_val_{j}") for j in range(bundle_size)]
+        tmp_addr = [self.alloc_scratch(f"tmp_addr_{j}") for j in range(bundle_size)]
+        tmp1 = [self.alloc_scratch(f"tmp1_{j}") for j in range(bundle_size)]
+        tmp2 = [self.alloc_scratch(f"tmp2_{j}") for j in range(bundle_size)]
+        tmp3 = [self.alloc_scratch(f"tmp3_{j}") for j in range(bundle_size)]
 
         for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+            # Process batch in groups of bundle_size
+            for group_start in range(0, batch_size, bundle_size):
+                group_end = min(group_start + bundle_size, batch_size)
+                group_items = list(range(group_start, group_end))
+
+                # idx = mem[inp_indices_p + i] - bundled ALU + load
+                alu_ops = []
+                for j, i in enumerate(group_items):
+                    i_const = self.scratch_const(i)
+                    alu_ops.append(("+", tmp_addr[j], self.scratch["inp_indices_p"], i_const))
+                body.append(("bundle", {"alu": alu_ops}))
+
+                load_ops = []
+                for j, i in enumerate(group_items):
+                    load_ops.append(("load", tmp_idx[j], tmp_addr[j]))
+                body.append(("bundle", {"load": load_ops}))
+
+                for j, i in enumerate(group_items):
+                    body.append(("debug", ("compare", tmp_idx[j], (round, i, "idx"))))
+
+                # val = mem[inp_values_p + i] - bundled ALU + load
+                alu_ops = []
+                for j, i in enumerate(group_items):
+                    i_const = self.scratch_const(i)
+                    alu_ops.append(("+", tmp_addr[j], self.scratch["inp_values_p"], i_const))
+                body.append(("bundle", {"alu": alu_ops}))
+
+                load_ops = []
+                for j, i in enumerate(group_items):
+                    load_ops.append(("load", tmp_val[j], tmp_addr[j]))
+                body.append(("bundle", {"load": load_ops}))
+
+                for j, i in enumerate(group_items):
+                    body.append(("debug", ("compare", tmp_val[j], (round, i, "val"))))
+
+                # node_val = mem[forest_values_p + idx] - bundled ALU + load
+                alu_ops = []
+                for j, i in enumerate(group_items):
+                    alu_ops.append(("+", tmp_addr[j], self.scratch["forest_values_p"], tmp_idx[j]))
+                body.append(("bundle", {"alu": alu_ops}))
+
+                load_ops = []
+                for j, i in enumerate(group_items):
+                    load_ops.append(("load", tmp_node_val[j], tmp_addr[j]))
+                body.append(("bundle", {"load": load_ops}))
+
+                for j, i in enumerate(group_items):
+                    body.append(("debug", ("compare", tmp_node_val[j], (round, i, "node_val"))))
+
+                # val = myhash(val ^ node_val) - bundled ALU
+                alu_ops = []
+                for j, i in enumerate(group_items):
+                    alu_ops.append(("^", tmp_val[j], tmp_val[j], tmp_node_val[j]))
+                body.append(("bundle", {"alu": alu_ops}))
+
+                # Hash stages - bundled
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    alu_ops = []
+                    for j, i in enumerate(group_items):
+                        alu_ops.append((op1, tmp1[j], tmp_val[j], self.scratch_const(val1)))
+                    body.append(("bundle", {"alu": alu_ops}))
+
+                    alu_ops = []
+                    for j, i in enumerate(group_items):
+                        alu_ops.append((op3, tmp2[j], tmp_val[j], self.scratch_const(val3)))
+                    body.append(("bundle", {"alu": alu_ops}))
+
+                    alu_ops = []
+                    for j, i in enumerate(group_items):
+                        alu_ops.append((op2, tmp_val[j], tmp1[j], tmp2[j]))
+                    body.append(("bundle", {"alu": alu_ops}))
+
+                    for j, i in enumerate(group_items):
+                        body.append(("debug", ("compare", tmp_val[j], (round, i, "hash_stage", hi))))
+
+                for j, i in enumerate(group_items):
+                    body.append(("debug", ("compare", tmp_val[j], (round, i, "hashed_val"))))
+
+                # idx = 2*idx + (1 if val % 2 == 0 else 2) - bundled ops
+                alu_ops = []
+                for j, i in enumerate(group_items):
+                    alu_ops.append(("%", tmp1[j], tmp_val[j], two_const))
+                body.append(("bundle", {"alu": alu_ops}))
+
+                alu_ops = []
+                for j, i in enumerate(group_items):
+                    alu_ops.append(("==", tmp1[j], tmp1[j], zero_const))
+                body.append(("bundle", {"alu": alu_ops}))
+
+                for j, i in enumerate(group_items):
+                    body.append(("flow", ("select", tmp3[j], tmp1[j], one_const, two_const)))
+
+                alu_ops = []
+                for j, i in enumerate(group_items):
+                    alu_ops.append(("*", tmp_idx[j], tmp_idx[j], two_const))
+                body.append(("bundle", {"alu": alu_ops}))
+
+                alu_ops = []
+                for j, i in enumerate(group_items):
+                    alu_ops.append(("+", tmp_idx[j], tmp_idx[j], tmp3[j]))
+                body.append(("bundle", {"alu": alu_ops}))
+
+                for j, i in enumerate(group_items):
+                    body.append(("debug", ("compare", tmp_idx[j], (round, i, "next_idx"))))
+
+                # idx = 0 if idx >= n_nodes else idx - bundled ops
+                alu_ops = []
+                for j, i in enumerate(group_items):
+                    alu_ops.append(("<", tmp1[j], tmp_idx[j], self.scratch["n_nodes"]))
+                body.append(("bundle", {"alu": alu_ops}))
+
+                for j, i in enumerate(group_items):
+                    body.append(("flow", ("select", tmp_idx[j], tmp1[j], tmp_idx[j], zero_const)))
+
+                for j, i in enumerate(group_items):
+                    body.append(("debug", ("compare", tmp_idx[j], (round, i, "wrapped_idx"))))
+
+                # mem[inp_indices_p + i] = idx - bundled ops
+                alu_ops = []
+                for j, i in enumerate(group_items):
+                    i_const = self.scratch_const(i)
+                    alu_ops.append(("+", tmp_addr[j], self.scratch["inp_indices_p"], i_const))
+                body.append(("bundle", {"alu": alu_ops}))
+
+                store_ops = []
+                for j, i in enumerate(group_items):
+                    store_ops.append(("store", tmp_addr[j], tmp_idx[j]))
+                body.append(("bundle", {"store": store_ops}))
+
+                # mem[inp_values_p + i] = val - bundled ops
+                alu_ops = []
+                for j, i in enumerate(group_items):
+                    i_const = self.scratch_const(i)
+                    alu_ops.append(("+", tmp_addr[j], self.scratch["inp_values_p"], i_const))
+                body.append(("bundle", {"alu": alu_ops}))
+
+                store_ops = []
+                for j, i in enumerate(group_items):
+                    store_ops.append(("store", tmp_addr[j], tmp_val[j]))
+                body.append(("bundle", {"store": store_ops}))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
