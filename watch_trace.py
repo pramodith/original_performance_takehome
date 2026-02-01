@@ -7,7 +7,24 @@ import urllib.request
 
 # Define a handler class
 class MyHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP request handler for serving trace files and Perfetto UI.
+
+    Serves the trace viewer HTML, trace.json data, modification times,
+    and proxies requests to the Perfetto UI.
+    """
+
     def do_GET(self):
+        """Handle GET requests for trace data and related resources.
+
+        Routes:
+            /: Serves the watch_trace.html viewer page.
+            /trace.json: Streams the trace.json file contents.
+            /mtime: Returns the modification time of trace.json.
+            /perfetto/*: Proxies requests to ui.perfetto.dev.
+
+        Raises:
+            IOError: If requested files cannot be read.
+        """
         try:
             # Serve a string constant at the index
             if self.path == "/":
@@ -72,6 +89,15 @@ class MyHandler(http.server.BaseHTTPRequestHandler):
 
 # Start the server
 def run(server_class=http.server.HTTPServer, handler_class=MyHandler):
+    """Start the HTTP server for trace visualization.
+
+    Launches a local web server on port 8000 and opens a browser window
+    to display the trace viewer.
+
+    Args:
+        server_class: The HTTP server class to use. Defaults to HTTPServer.
+        handler_class: The request handler class. Defaults to MyHandler.
+    """
     server_address = ("", 8000)
     httpd = server_class(server_address, handler_class)
     print("Starting httpd...")

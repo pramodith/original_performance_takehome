@@ -42,6 +42,15 @@ class DebugInfo:
 
 
 def cdiv(a, b):
+    """Compute ceiling division of two integers.
+
+    Args:
+        a: The dividend.
+        b: The divisor.
+
+    Returns:
+        int: The ceiling of a divided by b.
+    """
     return (a + b - 1) // b
 
 
@@ -104,6 +113,17 @@ class Machine:
         trace: bool = False,
         value_trace: dict[Any, int] = {},
     ):
+        """Initialize a new Machine simulator.
+
+        Args:
+            mem_dump: Initial memory contents as a list of 32-bit integers.
+            program: List of instruction bundles to execute.
+            debug_info: Debug information including scratch memory mapping.
+            n_cores: Number of cores to simulate. Defaults to 1.
+            scratch_size: Size of scratch memory per core. Defaults to SCRATCH_SIZE.
+            trace: Whether to enable trace output to trace.json. Defaults to False.
+            value_trace: Dictionary for storing traced values. Defaults to empty dict.
+        """
         self.cores = [
             Core(id=i, scratch=[0] * scratch_size, trace_buf=[]) for i in range(n_cores)
         ]
@@ -132,18 +152,40 @@ class Machine:
         return res
 
     def print_step(self, instr, core):
+        """Print debug information for a single execution step.
+
+        Args:
+            instr: The instruction being executed.
+            core: The core executing the instruction.
+        """
         # print(core.id)
         # print(core.trace_buf)
         print(self.scratch_map(core))
         print(core.pc, instr, self.rewrite_instr(instr))
 
     def scratch_map(self, core):
+        """Create a dictionary mapping scratch variable names to their values.
+
+        Args:
+            core: The core whose scratch memory to map.
+
+        Returns:
+            dict: Dictionary mapping variable names to their current values.
+        """
         res = {}
         for addr, (name, length) in self.debug_info.scratch_map.items():
             res[name] = core.scratch[addr : addr + length]
         return res
 
     def rewrite_slot(self, slot):
+        """Rewrite a slot tuple replacing scratch addresses with variable names.
+
+        Args:
+            slot: Tuple containing operation and operands with scratch addresses.
+
+        Returns:
+            tuple: Slot with scratch addresses replaced by variable names where available.
+        """
         return tuple(
             self.debug_info.scratch_map.get(s, (None, None))[0] or s for s in slot
         )
@@ -195,6 +237,12 @@ class Machine:
                 )
 
     def run(self):
+        """Run the machine until all cores are paused or stopped.
+
+        Executes instructions on all running cores until they either pause
+        (via a pause instruction) or stop (via halt or reaching end of program).
+        Updates the cycle counter for each instruction bundle executed.
+        """
         for core in self.cores:
             if core.state == CoreState.PAUSED:
                 core.state = CoreState.RUNNING
@@ -217,6 +265,19 @@ class Machine:
                 self.cycle += 1
 
     def alu(self, core, op, dest, a1, a2):
+        """Execute a scalar ALU operation.
+
+        Args:
+            core: The core executing the operation.
+            op: The operation to perform ("+", "-", "*", "//", "cdiv", "^",
+                "&", "|", "<<", ">>", "%", "<", "==").
+            dest: Scratch address to store the result.
+            a1: Scratch address of the first operand.
+            a2: Scratch address of the second operand.
+
+        Raises:
+            NotImplementedError: If the operation is not recognized.
+        """
         a1 = core.scratch[a1]
         a2 = core.scratch[a2]
         match op:
@@ -252,6 +313,18 @@ class Machine:
         self.scratch_write[dest] = res
 
     def valu(self, core, *slot):
+        """Execute a vector ALU operation.
+
+        Supports vbroadcast, multiply_add, and element-wise operations on
+        vectors of VLEN elements.
+
+        Args:
+            core: The core executing the operation.
+            *slot: Variable arguments containing operation type and operands.
+
+        Raises:
+            NotImplementedError: If the operation is not recognized.
+        """
         match slot:
             case ("vbroadcast", dest, src):
                 for i in range(VLEN):
@@ -267,6 +340,17 @@ class Machine:
                 raise NotImplementedError(f"Unknown valu op {slot}")
 
     def load(self, core, *slot):
+        """Execute a load operation from memory to scratch.
+
+        Supports scalar load, load with offset, vector load, and constant load.
+
+        Args:
+            core: The core executing the operation.
+            *slot: Variable arguments containing load type and operands.
+
+        Raises:
+            NotImplementedError: If the load type is not recognized.
+        """
         match slot:
             case ("load", dest, addr):
                 # print(dest, addr, core.scratch[addr])
@@ -286,6 +370,17 @@ class Machine:
                 raise NotImplementedError(f"Unknown load op {slot}")
 
     def store(self, core, *slot):
+        """Execute a store operation from scratch to memory.
+
+        Supports scalar store and vector store operations.
+
+        Args:
+            core: The core executing the operation.
+            *slot: Variable arguments containing store type and operands.
+
+        Raises:
+            NotImplementedError: If the store type is not recognized.
+        """
         match slot:
             case ("store", addr, src):
                 addr = core.scratch[addr]
@@ -298,6 +393,18 @@ class Machine:
                 raise NotImplementedError(f"Unknown store op {slot}")
 
     def flow(self, core, *slot):
+        """Execute a flow control operation.
+
+        Supports select, add_imm, vselect, halt, pause, trace_write,
+        conditional/unconditional jumps, and coreid operations.
+
+        Args:
+            core: The core executing the operation.
+            *slot: Variable arguments containing flow control type and operands.
+
+        Raises:
+            NotImplementedError: If the flow control type is not recognized.
+        """
         match slot:
             case ("select", dest, cond, a, b):
                 self.scratch_write[dest] = (
@@ -335,6 +442,14 @@ class Machine:
                 raise NotImplementedError(f"Unknown flow op {slot}")
 
     def trace_post_step(self, instr, core):
+        """Write trace information after an instruction step.
+
+        Records scratch memory changes to the trace file for visualization.
+
+        Args:
+            instr: The instruction that was executed.
+            core: The core that executed the instruction.
+        """
         # You can add extra stuff to the trace if you want!
         for addr, (name, length) in self.debug_info.scratch_map.items():
             if any((addr + vi) in self.scratch_write for vi in range(length)):
@@ -345,6 +460,14 @@ class Machine:
                 )
 
     def trace_slot(self, core, slot, name, i):
+        """Write a trace event for a single slot execution.
+
+        Args:
+            core: The core executing the slot.
+            slot: The slot being executed.
+            name: The engine name (e.g., "alu", "load").
+            i: The slot index within the engine.
+        """
         self.trace.write(
             f'{{"name": "{slot[0]}", "cat": "op", "ph": "X", "pid": {core.id}, "tid": {self.tids[(core.id, name, i)]}, "ts": {self.cycle}, "dur": 1, "args":{{"slot": "{str(slot)}", "named": "{str(self.rewrite_slot(slot))}" }} }},\n'
         )
@@ -397,6 +520,10 @@ class Machine:
         del self.mem_write
 
     def __del__(self):
+        """Clean up resources when the Machine is destroyed.
+
+        Closes the trace file if it was opened.
+        """
         if self.trace is not None:
             self.trace.write("]")
             self.trace.close()
@@ -413,6 +540,14 @@ class Tree:
 
     @staticmethod
     def generate(height: int):
+        """Generate a random binary tree with the specified height.
+
+        Args:
+            height: The height of the tree to generate.
+
+        Returns:
+            Tree: A new Tree instance with randomly generated node values.
+        """
         n_nodes = 2 ** (height + 1) - 1
         values = [random.randint(0, 2**30 - 1) for _ in range(n_nodes)]
         return Tree(height, values)
@@ -431,6 +566,16 @@ class Input:
 
     @staticmethod
     def generate(forest: Tree, batch_size: int, rounds: int):
+        """Generate random input for tree traversal.
+
+        Args:
+            forest: The tree that will be traversed (used for context, not values).
+            batch_size: Number of parallel traversals to generate.
+            rounds: Number of traversal rounds to perform.
+
+        Returns:
+            Input: A new Input instance with indices starting at 0 and random values.
+        """
         indices = [0 for _ in range(batch_size)]
         values = [random.randint(0, 2**30 - 1) for _ in range(batch_size)]
         return Input(indices, values, rounds)
@@ -447,7 +592,17 @@ HASH_STAGES = [
 
 
 def myhash(a: int) -> int:
-    """A simple 32-bit hash function"""
+    """Compute a 32-bit hash of the input value.
+
+    Applies a series of operations defined in HASH_STAGES to produce
+    a deterministic hash value.
+
+    Args:
+        a: The integer value to hash.
+
+    Returns:
+        int: The 32-bit hash result.
+    """
     fns = {
         "+": lambda x, y: x + y,
         "^": lambda x, y: x ^ y,
@@ -465,13 +620,17 @@ def myhash(a: int) -> int:
 
 
 def reference_kernel(t: Tree, inp: Input):
-    """
-    Reference implementation of the kernel.
+    """Reference implementation of the kernel.
 
     A parallel tree traversal where at each node we set
     cur_inp_val = myhash(cur_inp_val ^ node_val)
     and then choose the left branch if cur_inp_val is even.
     If we reach the bottom of the tree we wrap around to the top.
+
+    Args:
+        t: The tree to traverse.
+        inp: The input containing indices, values, and round count.
+            Modified in place with final indices and values.
     """
     for h in range(inp.rounds):
         for i in range(len(inp.indices)):
@@ -485,8 +644,17 @@ def reference_kernel(t: Tree, inp: Input):
 
 
 def build_mem_image(t: Tree, inp: Input) -> list[int]:
-    """
-    Build a flat memory image of the problem.
+    """Build a flat memory image of the problem.
+
+    Creates a memory layout containing the tree values and input data
+    with a header containing metadata and pointers.
+
+    Args:
+        t: The tree whose values will be stored in memory.
+        inp: The input containing indices and values to store.
+
+    Returns:
+        list[int]: A flat memory image with header, tree values, indices, and values.
     """
     header = 7
     extra_room = len(t.values) + len(inp.indices) * 2 + VLEN * 2 + 32
@@ -514,7 +682,19 @@ def build_mem_image(t: Tree, inp: Input) -> list[int]:
 
 
 def myhash_traced(a: int, trace: dict[Any, int], round: int, batch_i: int) -> int:
-    """A simple 32-bit hash function"""
+    """Compute a 32-bit hash with intermediate value tracing.
+
+    Same as myhash but records intermediate values for debugging.
+
+    Args:
+        a: The integer value to hash.
+        trace: Dictionary to store intermediate values keyed by (round, batch_i, "hash_stage", i).
+        round: Current round number for trace key.
+        batch_i: Current batch index for trace key.
+
+    Returns:
+        int: The 32-bit hash result.
+    """
     fns = {
         "+": lambda x, y: x + y,
         "^": lambda x, y: x ^ y,
@@ -533,8 +713,16 @@ def myhash_traced(a: int, trace: dict[Any, int], round: int, batch_i: int) -> in
 
 
 def reference_kernel2(mem: list[int], trace: dict[Any, int] = {}):
-    """
-    Reference implementation of the kernel on a flat memory.
+    """Reference implementation of the kernel on a flat memory.
+
+    Generator that yields memory state at pause points for debugging.
+
+    Args:
+        mem: The flat memory image to operate on. Modified in place.
+        trace: Dictionary to store traced values for debugging. Defaults to empty dict.
+
+    Yields:
+        list[int]: The memory state at each pause point.
     """
     # This is the initial memory layout
     rounds = mem[0]

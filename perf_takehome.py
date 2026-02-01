@@ -38,7 +38,22 @@ from problem import (
 
 
 class KernelBuilder:
+    """Builder class for constructing kernel programs for the VLIW SIMD machine.
+
+    This class provides methods to build instruction sequences for the custom
+    VLIW architecture, including scratch memory allocation, constant handling,
+    and kernel construction.
+
+    Attributes:
+        instrs: List of instruction bundles that form the program.
+        scratch: Dictionary mapping variable names to scratch addresses.
+        scratch_debug: Dictionary mapping scratch addresses to (name, length) tuples.
+        scratch_ptr: Current pointer into scratch space for allocation.
+        const_map: Dictionary mapping constant values to their scratch addresses.
+    """
+
     def __init__(self):
+        """Initialize a new KernelBuilder with empty instruction list and scratch space."""
         self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
@@ -46,9 +61,25 @@ class KernelBuilder:
         self.const_map = {}
 
     def debug_info(self):
+        """Create a DebugInfo object from the current scratch map.
+
+        Returns:
+            DebugInfo: Debug information containing the scratch memory mapping.
+        """
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+        """Build instruction bundles from a list of engine-slot pairs.
+
+        Args:
+            slots: List of (engine, slot) tuples where engine is the execution
+                unit and slot contains the operation details.
+            vliw: Whether to use VLIW packing (currently unused).
+
+        Returns:
+            list: List of instruction dictionaries, each mapping an engine to
+                its slots.
+        """
         # Simple slot packing that just uses one slot per instruction bundle
         instrs = []
         for engine, slot in slots:
@@ -56,9 +87,28 @@ class KernelBuilder:
         return instrs
 
     def add(self, engine, slot):
+        """Add a single instruction slot to the program.
+
+        Args:
+            engine: The execution engine name (e.g., "alu", "load", "store", "flow").
+            slot: Tuple containing the operation and its operands.
+        """
         self.instrs.append({engine: [slot]})
 
     def alloc_scratch(self, name=None, length=1):
+        """Allocate scratch memory space.
+
+        Args:
+            name: Optional name for the scratch variable. If provided, the
+                address is stored in the scratch dictionary.
+            length: Number of words to allocate. Defaults to 1.
+
+        Returns:
+            int: The starting address of the allocated scratch space.
+
+        Raises:
+            AssertionError: If allocation would exceed SCRATCH_SIZE.
+        """
         addr = self.scratch_ptr
         if name is not None:
             self.scratch[name] = addr
@@ -68,6 +118,18 @@ class KernelBuilder:
         return addr
 
     def scratch_const(self, val, name=None):
+        """Get or create a scratch address containing a constant value.
+
+        If the constant already exists in scratch memory, returns its address.
+        Otherwise, allocates new scratch space and emits a const load instruction.
+
+        Args:
+            val: The constant value to store.
+            name: Optional name for the scratch variable.
+
+        Returns:
+            int: The scratch address containing the constant.
+        """
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
             self.add("load", ("const", addr, val))
@@ -75,6 +137,21 @@ class KernelBuilder:
         return self.const_map[val]
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
+        """Build instruction slots for the hash computation.
+
+        Generates ALU instructions implementing the HASH_STAGES operations
+        along with debug comparison instructions.
+
+        Args:
+            val_hash_addr: Scratch address holding the value to hash (modified in place).
+            tmp1: Scratch address for temporary storage.
+            tmp2: Scratch address for temporary storage.
+            round: Current round number (for debug tracing).
+            i: Current batch index (for debug tracing).
+
+        Returns:
+            list: List of (engine, slot) tuples implementing the hash stages.
+        """
         slots = []
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
@@ -88,9 +165,16 @@ class KernelBuilder:
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        """
+        """Build the complete kernel program for tree traversal.
+
         Like reference_kernel2 but building actual instructions.
         Scalar implementation using only scalar ALU and load/store.
+
+        Args:
+            forest_height: Height of the binary tree.
+            n_nodes: Total number of nodes in the tree.
+            batch_size: Number of parallel traversals in each batch.
+            rounds: Number of traversal rounds to perform.
         """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -183,6 +267,25 @@ def do_kernel_test(
     trace: bool = False,
     prints: bool = False,
 ):
+    """Execute a kernel test with the specified parameters.
+
+    Builds and runs a kernel on a randomly generated tree, comparing results
+    against the reference implementation.
+
+    Args:
+        forest_height: Height of the binary tree to generate.
+        rounds: Number of traversal rounds to perform.
+        batch_size: Number of parallel traversals in each batch.
+        seed: Random seed for reproducible tree generation. Defaults to 123.
+        trace: Whether to enable execution tracing. Defaults to False.
+        prints: Whether to print intermediate values. Defaults to False.
+
+    Returns:
+        int: The number of cycles taken to execute the kernel.
+
+    Raises:
+        AssertionError: If the kernel output does not match the reference.
+    """
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
     forest = Tree.generate(forest_height)
@@ -226,6 +329,8 @@ def do_kernel_test(
 
 
 class Tests(unittest.TestCase):
+    """Unit tests for the kernel implementation and reference kernels."""
+
     def test_ref_kernels(self):
         """
         Test the reference kernels against each other
@@ -242,6 +347,10 @@ class Tests(unittest.TestCase):
             assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
 
     def test_kernel_trace(self):
+        """Test kernel execution with tracing enabled.
+
+        Runs a full-scale example for performance testing with trace output.
+        """
         # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
 
@@ -255,6 +364,11 @@ class Tests(unittest.TestCase):
     #             )
 
     def test_kernel_cycles(self):
+        """Test kernel execution and report cycle count.
+
+        Runs the kernel with standard parameters and prints cycle count
+        and speedup over baseline.
+        """
         do_kernel_test(10, 16, 256)
 
 
