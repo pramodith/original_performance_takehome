@@ -258,6 +258,23 @@ class KernelBuilder:
             valu_ops.append(("vbroadcast", s['val3_vecs'][hi], self.scratch_const(val3)))
         body.append(("bundle", {"valu": valu_ops}))
 
+    def _build_gather_round0(self, body, s, num_vectors):
+        """Optimized gather for round 0 where all indices are 0.
+
+        Instead of 8 individual loads, we load the root value once and broadcast.
+        """
+        # Load forest_values[0] (root node) - address is just forest_values_p
+        # Use tmp_addr[0] as a temporary scalar location
+        body.append(("bundle", {"load": [("load", s['tmp_addr'][0], self.scratch["forest_values_p"])]}))
+
+        # Broadcast root value to all tmp_node_val vectors
+        valu_ops = [("vbroadcast", s['tmp_node_val'][v], s['tmp_addr'][0]) for v in range(num_vectors)]
+        body.append(("bundle", {"valu": valu_ops}))
+
+        # XOR with tmp_val
+        valu_ops = [("^", s['tmp_val'][v], s['tmp_val'][v], s['tmp_node_val'][v]) for v in range(num_vectors)]
+        body.append(("bundle", {"valu": valu_ops}))
+
     def _build_gather_node_values(self, body, s, group_items, num_vectors):
         """Build gather operation to load node values from tree (non-contiguous addresses).
 
@@ -429,7 +446,11 @@ class KernelBuilder:
                 self._build_debug_compares(body, s, group_items, round, "val")
 
                 # Gather node values from tree
-                self._build_gather_node_values(body, s, group_items, num_vectors)
+                if round == 0:
+                    # Round 0: all indices are 0, so load root once and broadcast
+                    self._build_gather_round0(body, s, num_vectors)
+                else:
+                    self._build_gather_node_values(body, s, group_items, num_vectors)
                 self._build_debug_compares(body, s, group_items, round, "node_val")
 
                 # Hash computation
