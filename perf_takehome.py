@@ -166,6 +166,25 @@ class KernelBuilder:
 
         return slots
 
+    def add_offset_ops(self, alu_ops, dest, base, offset, tmp_addr):
+        """Add ALU op for base + offset, skipping if offset is 0.
+
+        Args:
+            alu_ops: List to append ALU operations to.
+            dest: List to append resulting addresses to.
+            base: Scratch address of base pointer.
+            offset: Integer offset to add.
+            tmp_addr: Scratch address to use for computed result.
+
+        Returns the scratch address to use (base if offset==0, tmp_addr otherwise).
+        """
+        if offset == 0:
+            dest.append(base)
+        else:
+            offset_const = self.scratch_const(offset)
+            alu_ops.append(("+", tmp_addr, base, offset_const))
+            dest.append(tmp_addr)
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
@@ -251,18 +270,19 @@ class KernelBuilder:
                 group_items = list(range(group_start, group_end))
 
                 # Load idx using vload (contiguous loads)
-                # Compute base addresses for each vector
+                # Compute base addresses for each vector (skip +0 identity ops)
                 alu_ops = []
+                idx_addrs = []
                 for v in range(num_vectors):
                     offset = group_start + v * VLEN
-                    offset_const = self.scratch_const(offset)
-                    alu_ops.append(("+", vload_addr[v], self.scratch["inp_indices_p"], offset_const))
-                body.append(("bundle", {"alu": alu_ops}))
+                    self.add_offset_ops(alu_ops, idx_addrs, self.scratch["inp_indices_p"], offset, vload_addr[v])
+                if alu_ops:
+                    body.append(("bundle", {"alu": alu_ops}))
 
                 # vload idx vectors (2 vloads = 16 elements)
                 load_ops = []
                 for v in range(num_vectors):
-                    load_ops.append(("vload", tmp_idx[v], vload_addr[v]))
+                    load_ops.append(("vload", tmp_idx[v], idx_addrs[v]))
                 body.append(("bundle", {"load": load_ops}))
 
                 for j, i in enumerate(group_items):
@@ -271,15 +291,16 @@ class KernelBuilder:
 
                 # Load val using vload (contiguous loads)
                 alu_ops = []
+                val_addrs = []
                 for v in range(num_vectors):
                     offset = group_start + v * VLEN
-                    offset_const = self.scratch_const(offset)
-                    alu_ops.append(("+", vload_addr[v], self.scratch["inp_values_p"], offset_const))
-                body.append(("bundle", {"alu": alu_ops}))
+                    self.add_offset_ops(alu_ops, val_addrs, self.scratch["inp_values_p"], offset, vload_addr[v])
+                if alu_ops:
+                    body.append(("bundle", {"alu": alu_ops}))
 
                 load_ops = []
                 for v in range(num_vectors):
-                    load_ops.append(("vload", tmp_val[v], vload_addr[v]))
+                    load_ops.append(("vload", tmp_val[v], val_addrs[v]))
                 body.append(("bundle", {"load": load_ops}))
 
                 for j, i in enumerate(group_items):
@@ -411,28 +432,30 @@ class KernelBuilder:
 
                 # Store idx using vstore (contiguous stores)
                 alu_ops = []
+                idx_store_addrs = []
                 for v in range(num_vectors):
                     offset = group_start + v * VLEN
-                    offset_const = self.scratch_const(offset)
-                    alu_ops.append(("+", vload_addr[v], self.scratch["inp_indices_p"], offset_const))
-                body.append(("bundle", {"alu": alu_ops}))
+                    self.add_offset_ops(alu_ops, idx_store_addrs, self.scratch["inp_indices_p"], offset, vload_addr[v])
+                if alu_ops:
+                    body.append(("bundle", {"alu": alu_ops}))
 
                 store_ops = []
                 for v in range(num_vectors):
-                    store_ops.append(("vstore", vload_addr[v], tmp_idx[v]))
+                    store_ops.append(("vstore", idx_store_addrs[v], tmp_idx[v]))
                 body.append(("bundle", {"store": store_ops}))
 
                 # Store val using vstore (contiguous stores)
                 alu_ops = []
+                val_store_addrs = []
                 for v in range(num_vectors):
                     offset = group_start + v * VLEN
-                    offset_const = self.scratch_const(offset)
-                    alu_ops.append(("+", vload_addr[v], self.scratch["inp_values_p"], offset_const))
-                body.append(("bundle", {"alu": alu_ops}))
+                    self.add_offset_ops(alu_ops, val_store_addrs, self.scratch["inp_values_p"], offset, vload_addr[v])
+                if alu_ops:
+                    body.append(("bundle", {"alu": alu_ops}))
 
                 store_ops = []
                 for v in range(num_vectors):
-                    store_ops.append(("vstore", vload_addr[v], tmp_val[v]))
+                    store_ops.append(("vstore", val_store_addrs[v], tmp_val[v]))
                 body.append(("bundle", {"store": store_ops}))
 
         body_instrs = self.build(body)
