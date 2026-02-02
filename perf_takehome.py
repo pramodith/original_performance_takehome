@@ -259,7 +259,8 @@ class KernelBuilder:
     def _build_gather_node_values(self, body, s, group_items, num_vectors):
         """Build gather operation to load node values from tree (non-contiguous addresses).
 
-        Overlaps XOR of vector 0 with loading of vector 1 to save a cycle.
+        Overlaps XOR of vector 0 with loading of vector 1 to hide XOR latency.
+        XOR of vector 1 is done after all loads complete.
         """
         # Compute node_val addresses: forest_values_p + idx
         valu_ops = []
@@ -285,15 +286,16 @@ class KernelBuilder:
             else:
                 body.append(("bundle", {"load": load_ops}))
 
+        # XOR vector 1 after all loads are complete (can't overlap with hash stage due to dependency)
+        if num_vectors > 1:
+            valu_ops = [("^", s['tmp_val'][v], s['tmp_val'][v], s['tmp_node_val'][v]) for v in range(1, num_vectors)]
+            body.append(("bundle", {"valu": valu_ops}))
+
     def _build_hash_stages(self, body, s, num_vectors, group_items, round):
         """Build the 6-stage hash computation: val = myhash(val ^ node_val).
 
-        Vector 0 XOR is done in gather. Vector 1 XOR is done here.
+        All XORs are done in the gather phase before this function is called.
         """
-        # XOR vector 1 (vector 0 was XORed during gather)
-        valu_ops = [("^", s['tmp_val'][1], s['tmp_val'][1], s['tmp_node_val'][1])]
-        body.append(("bundle", {"valu": valu_ops}))
-
         # Apply 6 hash stages (constants already broadcast)
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             # Fused: tmp1 = val op1 val1, tmp2 = val op3 val3 (independent)
