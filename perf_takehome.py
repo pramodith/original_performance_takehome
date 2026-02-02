@@ -378,10 +378,11 @@ class KernelBuilder:
                 ]
                 body.append(("bundle", {"valu": valu_ops}))
 
-                # tmp1 = val % 2
+                # Fused: tmp1 = val % 2, idx = idx * 2 (independent operations)
                 valu_ops = []
                 for v in range(num_vectors):
                     valu_ops.append(("%", tmp1[v], tmp_val[v], two_vec))
+                    valu_ops.append(("*", tmp_idx[v], tmp_idx[v], two_vec))
                 body.append(("bundle", {"valu": valu_ops}))
 
                 # tmp1 = (tmp1 == 0)
@@ -393,12 +394,6 @@ class KernelBuilder:
                 # tmp3 = select(tmp1, 1, 2) - use vselect
                 for v in range(num_vectors):
                     body.append(("flow", ("vselect", tmp3[v], tmp1[v], one_vec, two_vec)))
-
-                # idx = idx * 2
-                valu_ops = []
-                for v in range(num_vectors):
-                    valu_ops.append(("*", tmp_idx[v], tmp_idx[v], two_vec))
-                body.append(("bundle", {"valu": valu_ops}))
 
                 # idx = idx + tmp3
                 valu_ops = []
