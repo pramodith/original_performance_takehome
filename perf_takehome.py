@@ -274,53 +274,55 @@ class KernelBuilder:
             ("vbroadcast", forest_values_p_vec, self.scratch["forest_values_p"]),
         ]}))
 
-        for round in range(rounds):
-            # Process batch in groups of bundle_size (16 elements = 2 vectors of 8)
-            for group_start in range(0, batch_size, bundle_size):
-                group_end = min(group_start + bundle_size, batch_size)
-                group_items = list(range(group_start, group_end))
+        # Swapped loop order: process each group across all rounds before moving to next group
+        # This allows us to keep idx/val in scratch and only load/store once per group
+        vload_addr_val = [self.alloc_scratch(f"vload_addr_val_{v}") for v in range(num_vectors)]
 
-                # Compute idx and val addresses (alu) - forest_values_p already broadcast before loop
-                # Need separate address scratch for val since we use vload_addr for idx
-                vload_addr_val = [self.alloc_scratch(f"vload_addr_val_{v}") for v in range(num_vectors)] if group_start == 0 and round == 0 else vload_addr_val
+        for group_start in range(0, batch_size, bundle_size):
+            group_end = min(group_start + bundle_size, batch_size)
+            group_items = list(range(group_start, group_end))
 
-                alu_ops = []
-                idx_addrs = []
-                val_addrs = []
-                for v in range(num_vectors):
-                    offset = group_start + v * VLEN
-                    self.add_offset_ops(alu_ops, idx_addrs, self.scratch["inp_indices_p"], offset, vload_addr[v])
-                    self.add_offset_ops(alu_ops, val_addrs, self.scratch["inp_values_p"], offset, vload_addr_val[v])
+            # Compute idx and val addresses (alu) - only once per group
+            alu_ops = []
+            idx_addrs = []
+            val_addrs = []
+            for v in range(num_vectors):
+                offset = group_start + v * VLEN
+                self.add_offset_ops(alu_ops, idx_addrs, self.scratch["inp_indices_p"], offset, vload_addr[v])
+                self.add_offset_ops(alu_ops, val_addrs, self.scratch["inp_values_p"], offset, vload_addr_val[v])
 
-                if alu_ops:
-                    body.append(("bundle", {"alu": alu_ops}))
+            if alu_ops:
+                body.append(("bundle", {"alu": alu_ops}))
 
-                # Cycle 2: vload idx vectors (2 vloads = 16 elements)
-                load_ops = []
-                for v in range(num_vectors):
-                    load_ops.append(("vload", tmp_idx[v], idx_addrs[v]))
-                body.append(("bundle", {"load": load_ops}))
+            # Load idx vectors once at start of group
+            load_ops = []
+            for v in range(num_vectors):
+                load_ops.append(("vload", tmp_idx[v], idx_addrs[v]))
+            body.append(("bundle", {"load": load_ops}))
 
+            # Load val vectors once at start of group
+            load_ops = []
+            for v in range(num_vectors):
+                load_ops.append(("vload", tmp_val[v], val_addrs[v]))
+            body.append(("bundle", {"load": load_ops}))
+
+            # Process all rounds for this group, keeping idx/val in scratch
+            for round in range(rounds):
                 for j, i in enumerate(group_items):
                     v, vi = j // VLEN, j % VLEN
                     body.append(("debug", ("compare", tmp_idx[v] + vi, (round, i, "idx"))))
-
-                # Cycle 3: vload val + compute node_val addresses (idx already loaded, forest_values_p already broadcast)
-                load_ops = []
-                for v in range(num_vectors):
-                    load_ops.append(("vload", tmp_val[v], val_addrs[v]))
-
-                valu_ops = []
-                for v in range(num_vectors):
-                    valu_ops.append(("+", tmp_addr[v], tmp_idx[v], forest_values_p_vec))
-
-                body.append(("bundle", {"load": load_ops, "valu": valu_ops}))
 
                 for j, i in enumerate(group_items):
                     v, vi = j // VLEN, j % VLEN
                     body.append(("debug", ("compare", tmp_val[v] + vi, (round, i, "val"))))
 
-                # Do individual node value loads in groups of 2 (the load slot limit)
+                # Compute node_val addresses: forest_values_p + idx
+                valu_ops = []
+                for v in range(num_vectors):
+                    valu_ops.append(("+", tmp_addr[v], tmp_idx[v], forest_values_p_vec))
+                body.append(("bundle", {"valu": valu_ops}))
+
+                # Do individual node value loads in groups of 2 (the load slot limit) - this is the gather
                 for load_start in range(0, len(group_items), SLOT_LIMITS["load"]):
                     load_end = min(load_start + SLOT_LIMITS["load"], len(group_items))
                     load_items = list(range(load_start, load_end))
@@ -412,33 +414,16 @@ class KernelBuilder:
                     v, vi = j // VLEN, j % VLEN
                     body.append(("debug", ("compare", tmp_idx[v] + vi, (round, i, "wrapped_idx"))))
 
-                # Store idx using vstore (contiguous stores)
-                alu_ops = []
-                idx_store_addrs = []
-                for v in range(num_vectors):
-                    offset = group_start + v * VLEN
-                    self.add_offset_ops(alu_ops, idx_store_addrs, self.scratch["inp_indices_p"], offset, vload_addr[v])
-                if alu_ops:
-                    body.append(("bundle", {"alu": alu_ops}))
+            # Store idx and val once at end of group (after all rounds)
+            store_ops = []
+            for v in range(num_vectors):
+                store_ops.append(("vstore", idx_addrs[v], tmp_idx[v]))
+            body.append(("bundle", {"store": store_ops}))
 
-                store_ops = []
-                for v in range(num_vectors):
-                    store_ops.append(("vstore", idx_store_addrs[v], tmp_idx[v]))
-                body.append(("bundle", {"store": store_ops}))
-
-                # Store val using vstore (contiguous stores)
-                alu_ops = []
-                val_store_addrs = []
-                for v in range(num_vectors):
-                    offset = group_start + v * VLEN
-                    self.add_offset_ops(alu_ops, val_store_addrs, self.scratch["inp_values_p"], offset, vload_addr[v])
-                if alu_ops:
-                    body.append(("bundle", {"alu": alu_ops}))
-
-                store_ops = []
-                for v in range(num_vectors):
-                    store_ops.append(("vstore", val_store_addrs[v], tmp_val[v]))
-                body.append(("bundle", {"store": store_ops}))
+            store_ops = []
+            for v in range(num_vectors):
+                store_ops.append(("vstore", val_addrs[v], tmp_val[v]))
+            body.append(("bundle", {"store": store_ops}))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
