@@ -215,9 +215,11 @@ class KernelBuilder:
         s['idx_plus_1'] = [self.alloc_scratch(f"idx_plus_1_{j}", VLEN) for j in range(num_vectors)]
         s['idx_plus_2'] = [self.alloc_scratch(f"idx_plus_2_{j}", VLEN) for j in range(num_vectors)]
 
-        # Scalar addresses for vload/vstore
-        s['vload_addr'] = [self.alloc_scratch(f"vload_addr_{j}") for j in range(num_vectors)]
-        s['vload_addr_val'] = [self.alloc_scratch(f"vload_addr_val_{v}") for v in range(num_vectors)]
+        # Scalar addresses for vload/vstore (two sets for ping-pong to enable fused store+load)
+        s['vload_addr_curr'] = [self.alloc_scratch(f"vload_addr_curr_{j}") for j in range(num_vectors)]
+        s['vload_addr_val_curr'] = [self.alloc_scratch(f"vload_addr_val_curr_{v}") for v in range(num_vectors)]
+        s['vload_addr_prev'] = [self.alloc_scratch(f"vload_addr_prev_{j}") for j in range(num_vectors)]
+        s['vload_addr_val_prev'] = [self.alloc_scratch(f"vload_addr_val_prev_{v}") for v in range(num_vectors)]
 
         # Hash stage constant vectors
         s['val1_vecs'] = [self.alloc_scratch(f"val1_vec_{hi}", VLEN) for hi in range(len(HASH_STAGES))]
@@ -375,23 +377,51 @@ class KernelBuilder:
         s = self._alloc_scratch_vectors(num_vectors)
         self._broadcast_constants(body, s, zero_const, one_const, two_const)
 
+        # Track previous group's addresses for fused store+load
+        prev_idx_addrs = None
+        prev_val_addrs = None
+
         # Main loop: process each group across all rounds
-        for group_start in range(0, batch_size, bundle_size):
+        for group_idx, group_start in enumerate(range(0, batch_size, bundle_size)):
             group_end = min(group_start + bundle_size, batch_size)
             group_items = list(range(group_start, group_end))
+            is_first = (group_idx == 0)
+            is_last = (group_start + bundle_size >= batch_size)
 
-            # Compute load/store addresses for this group
-            alu_ops, idx_addrs, val_addrs = [], [], []
+            # Select which scratch set to use (ping-pong)
+            if group_idx % 2 == 0:
+                curr_idx_scratch = s['vload_addr_curr']
+                curr_val_scratch = s['vload_addr_val_curr']
+            else:
+                curr_idx_scratch = s['vload_addr_prev']
+                curr_val_scratch = s['vload_addr_val_prev']
+
+            # Compute load/store addresses for this group (always store to scratch)
+            alu_ops = []
             for v in range(num_vectors):
                 offset = group_start + v * VLEN
-                self.add_offset_ops(alu_ops, idx_addrs, self.scratch["inp_indices_p"], offset, s['vload_addr'][v])
-                self.add_offset_ops(alu_ops, val_addrs, self.scratch["inp_values_p"], offset, s['vload_addr_val'][v])
-            if alu_ops:
-                body.append(("bundle", {"alu": alu_ops}))
+                offset_const = self.scratch_const(offset)
+                alu_ops.append(("+", curr_idx_scratch[v], self.scratch["inp_indices_p"], offset_const))
+                alu_ops.append(("+", curr_val_scratch[v], self.scratch["inp_values_p"], offset_const))
+            body.append(("bundle", {"alu": alu_ops}))
 
-            # Load idx and val once at start of group
-            body.append(("bundle", {"load": [("vload", s['tmp_idx'][v], idx_addrs[v]) for v in range(num_vectors)]}))
-            body.append(("bundle", {"load": [("vload", s['tmp_val'][v], val_addrs[v]) for v in range(num_vectors)]}))
+            curr_idx_addrs = curr_idx_scratch
+            curr_val_addrs = curr_val_scratch
+
+            if is_first:
+                # First group: just load
+                body.append(("bundle", {"load": [("vload", s['tmp_idx'][v], curr_idx_addrs[v]) for v in range(num_vectors)]}))
+                body.append(("bundle", {"load": [("vload", s['tmp_val'][v], curr_val_addrs[v]) for v in range(num_vectors)]}))
+            else:
+                # Fused store (prev group results) + load (current group inputs)
+                body.append(("bundle", {
+                    "store": [("vstore", prev_idx_addrs[v], s['tmp_idx'][v]) for v in range(num_vectors)],
+                    "load": [("vload", s['tmp_idx'][v], curr_idx_addrs[v]) for v in range(num_vectors)]
+                }))
+                body.append(("bundle", {
+                    "store": [("vstore", prev_val_addrs[v], s['tmp_val'][v]) for v in range(num_vectors)],
+                    "load": [("vload", s['tmp_val'][v], curr_val_addrs[v]) for v in range(num_vectors)]
+                }))
 
             # Process all rounds for this group
             for round in range(rounds):
@@ -414,9 +444,14 @@ class KernelBuilder:
                 self._build_wrap_check(body, s, num_vectors)
                 self._build_debug_compares(body, s, group_items, round, "wrapped_idx")
 
-            # Store idx and val once at end of group
-            body.append(("bundle", {"store": [("vstore", idx_addrs[v], s['tmp_idx'][v]) for v in range(num_vectors)]}))
-            body.append(("bundle", {"store": [("vstore", val_addrs[v], s['tmp_val'][v]) for v in range(num_vectors)]}))
+            # Save current addresses for next iteration's store
+            prev_idx_addrs = curr_idx_addrs
+            prev_val_addrs = curr_val_addrs
+
+            if is_last:
+                # Last group: store final results
+                body.append(("bundle", {"store": [("vstore", curr_idx_addrs[v], s['tmp_idx'][v]) for v in range(num_vectors)]}))
+                body.append(("bundle", {"store": [("vstore", curr_val_addrs[v], s['tmp_val'][v]) for v in range(num_vectors)]}))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
