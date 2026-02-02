@@ -245,6 +245,8 @@ class KernelBuilder:
         tmp1 = [self.alloc_scratch(f"tmp1_{j}", VLEN) for j in range(num_vectors)]
         tmp2 = [self.alloc_scratch(f"tmp2_{j}", VLEN) for j in range(num_vectors)]
         tmp3 = [self.alloc_scratch(f"tmp3_{j}", VLEN) for j in range(num_vectors)]
+        idx_plus_1 = [self.alloc_scratch(f"idx_plus_1_{j}", VLEN) for j in range(num_vectors)]
+        idx_plus_2 = [self.alloc_scratch(f"idx_plus_2_{j}", VLEN) for j in range(num_vectors)]
 
         # Allocate scalar addresses for vload/vstore base pointers
         vload_addr = [self.alloc_scratch(f"vload_addr_{j}") for j in range(num_vectors)]
@@ -269,6 +271,7 @@ class KernelBuilder:
             ("vbroadcast", zero_vec, zero_const),
             ("vbroadcast", one_vec, one_const),
             ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"]),
+            ("vbroadcast", forest_values_p_vec, self.scratch["forest_values_p"]),
         ]}))
 
         for round in range(rounds):
@@ -277,7 +280,7 @@ class KernelBuilder:
                 group_end = min(group_start + bundle_size, batch_size)
                 group_items = list(range(group_start, group_end))
 
-                # Cycle 1: Compute idx and val addresses (alu) + broadcast forest_values_p (valu)
+                # Compute idx and val addresses (alu) - forest_values_p already broadcast before loop
                 # Need separate address scratch for val since we use vload_addr for idx
                 vload_addr_val = [self.alloc_scratch(f"vload_addr_val_{v}") for v in range(num_vectors)] if group_start == 0 and round == 0 else vload_addr_val
 
@@ -289,13 +292,8 @@ class KernelBuilder:
                     self.add_offset_ops(alu_ops, idx_addrs, self.scratch["inp_indices_p"], offset, vload_addr[v])
                     self.add_offset_ops(alu_ops, val_addrs, self.scratch["inp_values_p"], offset, vload_addr_val[v])
 
-                valu_ops = [("vbroadcast", forest_values_p_vec, self.scratch["forest_values_p"])]
-
-                bundle = {}
                 if alu_ops:
-                    bundle["alu"] = alu_ops
-                bundle["valu"] = valu_ops
-                body.append(("bundle", bundle))
+                    body.append(("bundle", {"alu": alu_ops}))
 
                 # Cycle 2: vload idx vectors (2 vloads = 16 elements)
                 load_ops = []
@@ -380,28 +378,18 @@ class KernelBuilder:
                 # idx = 2*idx + (1 if val % 2 == 0 else 2) - use valu
                 # Constants already broadcast before the loop
 
-                # Fused: tmp1 = val % 2, idx = idx * 2 (independent operations)
+                # Fused: tmp1 = val % 2, idx_plus_1 = 2*idx+1, idx_plus_2 = 2*idx+2
                 valu_ops = []
                 for v in range(num_vectors):
                     valu_ops.append(("%", tmp1[v], tmp_val[v], two_vec))
-                    valu_ops.append(("*", tmp_idx[v], tmp_idx[v], two_vec))
+                    valu_ops.append(("multiply_add", idx_plus_1[v], tmp_idx[v], two_vec, one_vec))
+                    valu_ops.append(("multiply_add", idx_plus_2[v], tmp_idx[v], two_vec, two_vec))
                 body.append(("bundle", {"valu": valu_ops}))
 
-                # tmp1 = (tmp1 == 0)
-                valu_ops = []
+                # idx = select based on val%2: if even (tmp1=0) pick idx_plus_1, if odd (tmp1=1) pick idx_plus_2
+                # Swap args to avoid needing tmp1 == 0 computation
                 for v in range(num_vectors):
-                    valu_ops.append(("==", tmp1[v], tmp1[v], zero_vec))
-                body.append(("bundle", {"valu": valu_ops}))
-
-                # tmp3 = select(tmp1, 1, 2) - use vselect
-                for v in range(num_vectors):
-                    body.append(("flow", ("vselect", tmp3[v], tmp1[v], one_vec, two_vec)))
-
-                # idx = idx + tmp3
-                valu_ops = []
-                for v in range(num_vectors):
-                    valu_ops.append(("+", tmp_idx[v], tmp_idx[v], tmp3[v]))
-                body.append(("bundle", {"valu": valu_ops}))
+                    body.append(("flow", ("vselect", tmp_idx[v], tmp1[v], idx_plus_2[v], idx_plus_1[v])))
 
                 for j, i in enumerate(group_items):
                     v, vi = j // VLEN, j % VLEN
