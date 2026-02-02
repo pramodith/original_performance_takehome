@@ -280,16 +280,14 @@ class KernelBuilder:
                 load_ops.append(("load", s['tmp_node_val'][v] + vi, s['tmp_addr'][v] + vi))
 
             # On cycle 4 (first cycle of loading vector 1), XOR the completed vector 0
-            if load_cycle == loads_per_vector:
-                valu_ops = [("^", s['tmp_val'][0], s['tmp_val'][0], s['tmp_node_val'][0])]
+            if load_cycle > 0 and load_cycle % loads_per_vector == 0:
+                valu_ops = [("^", s['tmp_val'][v-1], s['tmp_val'][v-1], s['tmp_node_val'][v-1])]
                 body.append(("bundle", {"load": load_ops, "valu": valu_ops}))
             else:
                 body.append(("bundle", {"load": load_ops}))
 
-        # XOR vector 1 after all loads are complete (can't overlap with hash stage due to dependency)
-        if num_vectors > 1:
-            valu_ops = [("^", s['tmp_val'][v], s['tmp_val'][v], s['tmp_node_val'][v]) for v in range(1, num_vectors)]
-            body.append(("bundle", {"valu": valu_ops}))
+        valu_ops = [("^", s['tmp_val'][num_vectors-1], s['tmp_val'][num_vectors-1], s['tmp_node_val'][num_vectors-1])]
+        body.append(("bundle", {"valu": valu_ops}))
 
     def _build_hash_stages(self, body, s, num_vectors, group_items, round):
         """Build the 6-stage hash computation: val = myhash(val ^ node_val).
