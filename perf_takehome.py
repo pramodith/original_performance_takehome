@@ -257,7 +257,10 @@ class KernelBuilder:
         body.append(("bundle", {"valu": valu_ops}))
 
     def _build_gather_node_values(self, body, s, group_items, num_vectors):
-        """Build gather operation to load node values from tree (non-contiguous addresses)."""
+        """Build gather operation to load node values from tree (non-contiguous addresses).
+
+        Overlaps XOR of vector 0 with loading of vector 1 to save a cycle.
+        """
         # Compute node_val addresses: forest_values_p + idx
         valu_ops = []
         for v in range(num_vectors):
@@ -265,20 +268,30 @@ class KernelBuilder:
         body.append(("bundle", {"valu": valu_ops}))
 
         # Individual loads in groups of 2 (load slot limit)
-        for load_start in range(0, len(group_items), SLOT_LIMITS["load"]):
+        # After vector 0 is complete (4 cycles), XOR it while continuing to load vector 1
+        loads_per_vector = VLEN // SLOT_LIMITS["load"]  # 4 cycles to load one vector
+
+        for load_cycle, load_start in enumerate(range(0, len(group_items), SLOT_LIMITS["load"])):
             load_end = min(load_start + SLOT_LIMITS["load"], len(group_items))
             load_ops = []
             for li in range(load_start, load_end):
                 v, vi = li // VLEN, li % VLEN
                 load_ops.append(("load", s['tmp_node_val'][v] + vi, s['tmp_addr'][v] + vi))
-            body.append(("bundle", {"load": load_ops}))
+
+            # On cycle 4 (first cycle of loading vector 1), XOR the completed vector 0
+            if load_cycle == loads_per_vector:
+                valu_ops = [("^", s['tmp_val'][0], s['tmp_val'][0], s['tmp_node_val'][0])]
+                body.append(("bundle", {"load": load_ops, "valu": valu_ops}))
+            else:
+                body.append(("bundle", {"load": load_ops}))
 
     def _build_hash_stages(self, body, s, num_vectors, group_items, round):
-        """Build the 6-stage hash computation: val = myhash(val ^ node_val)."""
-        # XOR val with node_val (both vectors in one cycle)
-        valu_ops = []
-        for v in range(num_vectors):
-            valu_ops.append(("^", s['tmp_val'][v], s['tmp_val'][v], s['tmp_node_val'][v]))
+        """Build the 6-stage hash computation: val = myhash(val ^ node_val).
+
+        Vector 0 XOR is done in gather. Vector 1 XOR is done here.
+        """
+        # XOR vector 1 (vector 0 was XORed during gather)
+        valu_ops = [("^", s['tmp_val'][1], s['tmp_val'][1], s['tmp_node_val'][1])]
         body.append(("bundle", {"valu": valu_ops}))
 
         # Apply 6 hash stages (constants already broadcast)
