@@ -269,17 +269,27 @@ class KernelBuilder:
                 group_end = min(group_start + bundle_size, batch_size)
                 group_items = list(range(group_start, group_end))
 
-                # Load idx using vload (contiguous loads)
-                # Compute base addresses for each vector (skip +0 identity ops)
+                # Cycle 1: Compute idx and val addresses (alu) + broadcast forest_values_p (valu)
+                # Need separate address scratch for val since we use vload_addr for idx
+                vload_addr_val = [self.alloc_scratch(f"vload_addr_val_{v}") for v in range(num_vectors)] if group_start == 0 and round == 0 else vload_addr_val
+
                 alu_ops = []
                 idx_addrs = []
+                val_addrs = []
                 for v in range(num_vectors):
                     offset = group_start + v * VLEN
                     self.add_offset_ops(alu_ops, idx_addrs, self.scratch["inp_indices_p"], offset, vload_addr[v])
-                if alu_ops:
-                    body.append(("bundle", {"alu": alu_ops}))
+                    self.add_offset_ops(alu_ops, val_addrs, self.scratch["inp_values_p"], offset, vload_addr_val[v])
 
-                # vload idx vectors (2 vloads = 16 elements)
+                valu_ops = [("vbroadcast", forest_values_p_vec, self.scratch["forest_values_p"])]
+
+                bundle = {}
+                if alu_ops:
+                    bundle["alu"] = alu_ops
+                bundle["valu"] = valu_ops
+                body.append(("bundle", bundle))
+
+                # Cycle 2: vload idx vectors (2 vloads = 16 elements)
                 load_ops = []
                 for v in range(num_vectors):
                     load_ops.append(("vload", tmp_idx[v], idx_addrs[v]))
@@ -289,34 +299,22 @@ class KernelBuilder:
                     v, vi = j // VLEN, j % VLEN
                     body.append(("debug", ("compare", tmp_idx[v] + vi, (round, i, "idx"))))
 
-                # Load val using vload (contiguous loads)
-                alu_ops = []
-                val_addrs = []
-                for v in range(num_vectors):
-                    offset = group_start + v * VLEN
-                    self.add_offset_ops(alu_ops, val_addrs, self.scratch["inp_values_p"], offset, vload_addr[v])
-                if alu_ops:
-                    body.append(("bundle", {"alu": alu_ops}))
-
+                # Cycle 3: vload val + compute node_val addresses (idx already loaded, forest_values_p already broadcast)
                 load_ops = []
                 for v in range(num_vectors):
                     load_ops.append(("vload", tmp_val[v], val_addrs[v]))
-                body.append(("bundle", {"load": load_ops}))
+
+                valu_ops = []
+                for v in range(num_vectors):
+                    valu_ops.append(("+", tmp_addr[v], tmp_idx[v], forest_values_p_vec))
+
+                body.append(("bundle", {"load": load_ops, "valu": valu_ops}))
 
                 for j, i in enumerate(group_items):
                     v, vi = j // VLEN, j % VLEN
                     body.append(("debug", ("compare", tmp_val[v] + vi, (round, i, "val"))))
 
-                # node_val = mem[forest_values_p + idx] - this is a gather, need individual loads
-                # First broadcast forest_values_p, then compute addresses using valu
-                body.append(("bundle", {"valu": [("vbroadcast", forest_values_p_vec, self.scratch["forest_values_p"])]}))
-
-                valu_ops = []
-                for v in range(num_vectors):
-                    valu_ops.append(("+", tmp_addr[v], tmp_idx[v], forest_values_p_vec))
-                body.append(("bundle", {"valu": valu_ops}))
-
-                # Do individual loads in groups of 2 (the load slot limit)
+                # Do individual node value loads in groups of 2 (the load slot limit)
                 for load_start in range(0, len(group_items), SLOT_LIMITS["load"]):
                     load_end = min(load_start + SLOT_LIMITS["load"], len(group_items))
                     load_items = list(range(load_start, load_end))
