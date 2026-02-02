@@ -274,6 +274,20 @@ class KernelBuilder:
             ("vbroadcast", forest_values_p_vec, self.scratch["forest_values_p"]),
         ]}))
 
+        # Broadcast all hash stage constants once (6 stages × 2 constants = 12 broadcasts)
+        # Split into two bundles since valu limit is 6
+        valu_ops = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES[:3]):
+            valu_ops.append(("vbroadcast", val1_vecs[hi], self.scratch_const(val1)))
+            valu_ops.append(("vbroadcast", val3_vecs[hi], self.scratch_const(val3)))
+        body.append(("bundle", {"valu": valu_ops}))
+
+        valu_ops = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES[3:], start=3):
+            valu_ops.append(("vbroadcast", val1_vecs[hi], self.scratch_const(val1)))
+            valu_ops.append(("vbroadcast", val3_vecs[hi], self.scratch_const(val3)))
+        body.append(("bundle", {"valu": valu_ops}))
+
         # Swapped loop order: process each group across all rounds before moving to next group
         # This allows us to keep idx/val in scratch and only load/store once per group
         vload_addr_val = [self.alloc_scratch(f"vload_addr_val_{v}") for v in range(num_vectors)]
@@ -343,14 +357,8 @@ class KernelBuilder:
                     valu_ops.append(("^", tmp_val[v], tmp_val[v], tmp_node_val[v]))
                 body.append(("bundle", {"valu": valu_ops}))
 
-                # Hash stages - use valu
+                # Hash stages - use valu (constants already broadcast before loops)
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    # Broadcast constants (using pre-allocated vectors)
-                    valu_ops = []
-                    valu_ops.append(("vbroadcast", val1_vecs[hi], self.scratch_const(val1)))
-                    valu_ops.append(("vbroadcast", val3_vecs[hi], self.scratch_const(val3)))
-                    body.append(("bundle", {"valu": valu_ops}))
-
                     # tmp1 = val op1 val1
                     valu_ops = []
                     for v in range(num_vectors):
