@@ -263,6 +263,14 @@ class KernelBuilder:
         # Broadcast forest_values_p for address computation
         forest_values_p_vec = self.alloc_scratch("forest_values_p_vec", VLEN)
 
+        # Broadcast constant vectors once before the loop
+        body.append(("bundle", {"valu": [
+            ("vbroadcast", two_vec, two_const),
+            ("vbroadcast", zero_vec, zero_const),
+            ("vbroadcast", one_vec, one_const),
+            ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"]),
+        ]}))
+
         for round in range(rounds):
             # Process batch in groups of bundle_size (16 elements = 2 vectors of 8)
             for group_start in range(0, batch_size, bundle_size):
@@ -370,13 +378,7 @@ class KernelBuilder:
                     body.append(("debug", ("compare", tmp_val[v] + vi, (round, i, "hashed_val"))))
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2) - use valu
-                # Broadcast constants (using pre-allocated vectors)
-                valu_ops = [
-                    ("vbroadcast", two_vec, two_const),
-                    ("vbroadcast", zero_vec, zero_const),
-                    ("vbroadcast", one_vec, one_const),
-                ]
-                body.append(("bundle", {"valu": valu_ops}))
+                # Constants already broadcast before the loop
 
                 # Fused: tmp1 = val % 2, idx = idx * 2 (independent operations)
                 valu_ops = []
@@ -406,8 +408,7 @@ class KernelBuilder:
                     body.append(("debug", ("compare", tmp_idx[v] + vi, (round, i, "next_idx"))))
 
                 # idx = 0 if idx >= n_nodes else idx
-                # Broadcast n_nodes (using pre-allocated vector)
-                body.append(("bundle", {"valu": [("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])]}))
+                # n_nodes already broadcast before the loop
 
                 # tmp1 = idx < n_nodes
                 valu_ops = []
