@@ -284,11 +284,15 @@ class KernelBuilder:
         valu_ops = [("^", s['tmp_val'][v], s['tmp_val'][v], s['tmp_node_val'][v]) for v in range(num_vectors)]
         body.append(("bundle", {"valu": valu_ops}))
 
+    def _compute_gather_addr_ops(self, valu_ops, s, shared, num_vectors):
+        """Add valu ops for gather address computation: forest_values_p + idx."""
+        for v in range(num_vectors):
+            valu_ops.append(("+", s['tmp_addr'][v], s['tmp_idx'][v], shared['forest_values_p_vec']))
+
     def _build_gather_addr_compute(self, body, s, shared, num_vectors):
         """Compute gather addresses: forest_values_p + idx."""
         valu_ops = []
-        for v in range(num_vectors):
-            valu_ops.append(("+", s['tmp_addr'][v], s['tmp_idx'][v], shared['forest_values_p_vec']))
+        self._compute_gather_addr_ops(valu_ops, s, shared, num_vectors)
         body.append(("bundle", {"valu": valu_ops}))
 
     def _build_gather_loads(self, s, num_vectors):
@@ -583,26 +587,33 @@ class KernelBuilder:
             else:
                 # Rounds 1+: Pipeline A's compute with B's gather loads
 
-                # A: address compute
-                self._build_gather_addr_compute(body, sA, shared, num_vectors)
+                if round == 1:
+                    # Round 1: need to load A normally (not prefetched)
+                    # Fuse address compute for both A and B
+                    valu_ops = []
+                    self._compute_gather_addr_ops(valu_ops, sA, shared, num_vectors)
+                    self._compute_gather_addr_ops(valu_ops, sB, shared, num_vectors)
+                    body.append(("bundle", {"valu": valu_ops}))
 
-                # A: gather loads (no overlap yet)
-                load_cycles_A = self._build_gather_loads(sA, num_vectors)
-                for load_ops in load_cycles_A:
-                    body.append(("bundle", {"load": load_ops}))
+                    # A: gather loads (not prefetched for round 1)
+                    load_cycles_A = self._build_gather_loads(sA, num_vectors)
+                    for load_ops in load_cycles_A:
+                        body.append(("bundle", {"load": load_ops}))
+                else:
+                    # Rounds 2+: A's loads were prefetched, only compute B's addresses
+                    self._build_gather_addr_compute(body, sB, shared, num_vectors)
 
-                # A: XOR
-                self._build_gather_xor(body, sA, num_vectors)
-                self._build_debug_compares(body, sA, group_items_A, round, "node_val")
-
-                # B: address compute
-                self._build_gather_addr_compute(body, sB, shared, num_vectors)
-
-                # Generate B's gather loads to interleave with A's hash
+                # Generate B's gather loads
                 load_cycles_B = self._build_gather_loads(sB, num_vectors)
 
-                # A: hash stages with B's gather loads interleaved
-                self._build_hash_stages_with_loads(body, sA, shared, num_vectors, group_items_A, round, load_cycles_B)
+                # A: XOR fused with first B load
+                valu_ops = [("^", sA['tmp_val'][v], sA['tmp_val'][v], sA['tmp_node_val'][v]) for v in range(num_vectors)]
+                body.append(("bundle", {"valu": valu_ops, "load": load_cycles_B[0]}))
+                self._build_debug_compares(body, sA, group_items_A, round, "node_val")
+
+                # A: hash stages with remaining B loads interleaved
+                remaining_B_loads = load_cycles_B[1:]
+                self._build_hash_stages_with_loads(body, sA, shared, num_vectors, group_items_A, round, remaining_B_loads)
                 self._build_debug_compares(body, sA, group_items_A, round, "hashed_val")
 
                 # A: branch and wrap (B's loads should be done by now)
@@ -612,12 +623,25 @@ class KernelBuilder:
                 self._build_wrap_check(body, sA, shared, num_vectors)
                 self._build_debug_compares(body, sA, group_items_A, round, "wrapped_idx")
 
-                # B: XOR (loads completed during A's hash)
-                self._build_gather_xor(body, sB, num_vectors)
+                # Prefetch: compute A's gather addresses for next round (if not last round)
+                if round < rounds - 1:
+                    self._build_gather_addr_compute(body, sA, shared, num_vectors)
+                    next_round_A_loads = self._build_gather_loads(sA, num_vectors)
+                else:
+                    next_round_A_loads = []
+
+                # B: XOR fused with first A load for next round (if available)
+                valu_ops = [("^", sB['tmp_val'][v], sB['tmp_val'][v], sB['tmp_node_val'][v]) for v in range(num_vectors)]
+                if next_round_A_loads:
+                    body.append(("bundle", {"valu": valu_ops, "load": next_round_A_loads[0]}))
+                    remaining_A_loads = next_round_A_loads[1:]
+                else:
+                    body.append(("bundle", {"valu": valu_ops}))
+                    remaining_A_loads = []
                 self._build_debug_compares(body, sB, group_items_B, round, "node_val")
 
-                # B: hash, branch, wrap (no interleaving for now)
-                self._build_hash_stages(body, sB, shared, num_vectors, group_items_B, round)
+                # B: hash with remaining A loads for next round interleaved
+                self._build_hash_stages_with_loads(body, sB, shared, num_vectors, group_items_B, round, remaining_A_loads)
                 self._build_debug_compares(body, sB, group_items_B, round, "hashed_val")
 
                 self._build_branch_computation(body, sB, shared, num_vectors)
