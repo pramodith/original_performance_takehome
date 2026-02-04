@@ -344,15 +344,20 @@ class KernelBuilder:
         """Generate branch instructions for one group's round."""
         instrs = []
 
-        # Valu ops: tmp1 = val%2, idx_plus_1 = 2*idx+1, idx_plus_2 = 2*idx+2
+        # Optimized branch: idx = 2*idx + 1 + (val%2)
+        # This eliminates the vselect entirely!
+        # Original: idx = vselect(val%2, 2*idx+2, 2*idx+1)
+        # When val%2=1: 2*idx+2. When val%2=0: 2*idx+1
+        # So: 2*idx + 1 + (val%2)
         for v in range(num_vectors):
+            # tmp1 = val % 2
             instrs.append(Instruction("valu", ("%", s['tmp1'][v], s['tmp_val'][v], shared['two_vec']), group, 2, round_num, 0))
+            # idx_plus_1 = 2*idx + 1
             instrs.append(Instruction("valu", ("multiply_add", s['idx_plus_1'][v], s['tmp_idx'][v], shared['two_vec'], shared['one_vec']), group, 2, round_num, 0))
-            instrs.append(Instruction("valu", ("multiply_add", s['idx_plus_2'][v], s['tmp_idx'][v], shared['two_vec'], shared['two_vec']), group, 2, round_num, 0))
 
-        # Flow ops: vselect (must come after valu, all same seq since flow limit is 1 anyway)
+        # idx = idx_plus_1 + tmp1 (this is 2*idx + 1 + (val%2))
         for v in range(num_vectors):
-            instrs.append(Instruction("flow", ("vselect", s['tmp_idx'][v], s['tmp1'][v], s['idx_plus_2'][v], s['idx_plus_1'][v]), group, 2, round_num, 1))
+            instrs.append(Instruction("valu", ("+", s['tmp_idx'][v], s['idx_plus_1'][v], s['tmp1'][v]), group, 2, round_num, 1))
 
         # Debug compares
         for j, i in enumerate(group_items):
@@ -395,27 +400,89 @@ class KernelBuilder:
         instrs.extend(self._gen_wrap_instrs(s, shared, group, round_num, num_vectors, group_items))
         return instrs
 
-    def _schedule_group(self, instrs, idx, bundle):
-        """Schedule instructions from one group into a bundle. Returns (new_idx, scheduled_any)."""
+    # Operations that can be scalarized (valu -> alu)
+    SCALARIZABLE_OPS = {"+", "-", "^", "%", "*", "&", "|", "<", ">", "<=", ">=", "==", "!="}
+
+    def _scalarize_valu_op(self, op):
+        """Convert a valu operation to 8 scalar alu operations.
+
+        Args:
+            op: A valu operation tuple like ("+", dest_vec, src1_vec, src2_vec)
+
+        Returns:
+            List of 8 alu operations, one for each vector element.
+        """
+        opcode = op[0]
+        if opcode == "multiply_add":
+            # multiply_add(dest, a, b, c) = a * b + c
+            dest, a, b, c = op[1], op[2], op[3], op[4]
+            # We need a tmp for the multiplication - but we can't easily get one here
+            # For now, skip multiply_add scalarization
+            return None
+        elif len(op) == 4:
+            # Binary op: (op, dest, src1, src2)
+            dest, src1, src2 = op[1], op[2], op[3]
+            return [(opcode, dest + i, src1 + i, src2 + i) for i in range(VLEN)]
+        return None
+
+    def _schedule_group(self, instrs, idx, bundle, allow_phase_advance=True):
+        """Schedule instructions from one group into a bundle. Returns (new_idx, scheduled_any).
+
+        Args:
+            instrs: Sorted list of instructions for this group
+            idx: Current index into instrs
+            bundle: Current bundle being built
+            allow_phase_advance: If True, group can advance phases independently.
+                                 If False, all groups must stay at same (round, phase, seq).
+
+        Within a single group, seq boundaries are ALWAYS respected (data dependencies).
+        allow_phase_advance only controls whether different groups can be at different phases.
+        """
         scheduled = False
+        if idx >= len(instrs):
+            return idx, scheduled
+
+        # Track the current (round, phase, seq) for this group - can only schedule from this seq
+        current_seq_key = (instrs[idx].round, instrs[idx].phase, instrs[idx].seq)
+
         while idx < len(instrs):
             instr = instrs[idx]
+            instr_key = (instr.round, instr.phase, instr.seq)
+
+            # Always respect seq boundaries within a group (data dependencies)
+            if instr_key != current_seq_key:
+                break
+
             limit = SLOT_LIMITS.get(instr.engine, 1)
             if len(bundle[instr.engine]) < limit:
                 bundle[instr.engine].append(instr.op)
                 idx += 1
                 scheduled = True
-                # Check if next instruction has same (round, phase, seq) - can schedule together
-                if idx < len(instrs):
-                    next_instr = instrs[idx]
-                    if (next_instr.round, next_instr.phase, next_instr.seq) != (instr.round, instr.phase, instr.seq):
-                        break  # Different seq - wait for next cycle
+            elif instr.engine == "valu" and instr.op[0] in self.SCALARIZABLE_OPS:
+                # Valu slot full - try to scalarize to alu
+                alu_available = SLOT_LIMITS["alu"] - len(bundle["alu"])
+                if alu_available >= VLEN:
+                    # Enough alu slots to scalarize this valu op
+                    scalar_ops = self._scalarize_valu_op(instr.op)
+                    if scalar_ops:
+                        bundle["alu"].extend(scalar_ops)
+                        idx += 1
+                        scheduled = True
+                        continue
+                break  # Can't scalarize or not enough slots
             else:
-                break  # Slot full
+                break  # Slot full for this engine
         return idx, scheduled
 
-    def _schedule_instructions(self, *instr_lists):
-        """Schedule instructions from multiple groups into bundles respecting slot limits and dependencies."""
+    def _schedule_instructions(self, *instr_lists, allow_phase_advance=True, debug_phases=False):
+        """Schedule instructions from multiple groups into bundles respecting slot limits and dependencies.
+
+        Args:
+            instr_lists: Variable number of instruction lists (one per group)
+            allow_phase_advance: If True, groups can be at different phases.
+                                 If False, all groups stay in lock-step.
+            debug_phases: If True, print group positions to show phase divergence.
+        """
         bundles = []
 
         # Sort each group's instructions by (round, phase, seq)
@@ -424,12 +491,24 @@ class KernelBuilder:
 
         indices = [0] * len(instr_lists)
 
+        bundle_num = 0
         while any(indices[i] < len(instr_lists[i]) for i in range(len(instr_lists))):
             bundle = defaultdict(list)
             any_scheduled = False
 
+            # Debug: show group positions before scheduling
+            if debug_phases and bundle_num % 50 == 0:
+                positions = []
+                for i, instrs in enumerate(instr_lists):
+                    if indices[i] < len(instrs):
+                        instr = instrs[indices[i]]
+                        positions.append(f"{instr.group}:r{instr.round}p{instr.phase}s{instr.seq}")
+                    else:
+                        positions.append(f"G{i}:done")
+                print(f"Bundle {bundle_num}: {' | '.join(positions)}")
+
             for i, instrs in enumerate(instr_lists):
-                indices[i], scheduled = self._schedule_group(instrs, indices[i], bundle)
+                indices[i], scheduled = self._schedule_group(instrs, indices[i], bundle, allow_phase_advance)
                 any_scheduled = any_scheduled or scheduled
 
             out_bundle = {k: v for k, v in bundle.items() if v}
@@ -438,6 +517,8 @@ class KernelBuilder:
 
             if not any_scheduled:
                 break
+
+            bundle_num += 1
 
         return bundles
 
