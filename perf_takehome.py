@@ -248,6 +248,15 @@ class KernelBuilder:
         s['val1_vecs'] = [self.alloc_scratch(f"val1_vec_{hi}", VLEN) for hi in range(len(HASH_STAGES))]
         s['val3_vecs'] = [self.alloc_scratch(f"val3_vec_{hi}", VLEN) for hi in range(len(HASH_STAGES))]
 
+        # Multiplier vectors for optimized hash stages (where op1='+' and op2='+')
+        # Stage 0: multiplier = (1 << 12) + 1 = 4097
+        # Stage 2: multiplier = (1 << 5) + 1 = 33
+        # Stage 4: multiplier = (1 << 3) + 1 = 9
+        s['hash_mul_vecs'] = {}
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if op1 == '+' and op2 == '+':
+                s['hash_mul_vecs'][hi] = self.alloc_scratch(f"hash_mul_vec_{hi}", VLEN)
+
         # Constant vectors for branch computation
         s['two_vec'] = self.alloc_scratch("two_vec", VLEN)
         s['zero_vec'] = self.alloc_scratch("zero_vec", VLEN)
@@ -268,7 +277,7 @@ class KernelBuilder:
             ("vbroadcast", shared['forest_values_p_vec'], self.scratch["forest_values_p"]),
         ]}))
 
-        # Hash stage constants (split into two bundles, valu limit is 6)
+        # Hash stage constants (split into bundles, valu limit is 6)
         valu_ops = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES[:3]):
             valu_ops.append(("vbroadcast", shared['val1_vecs'][hi], self.scratch_const(val1)))
@@ -280,6 +289,15 @@ class KernelBuilder:
             valu_ops.append(("vbroadcast", shared['val1_vecs'][hi], self.scratch_const(val1)))
             valu_ops.append(("vbroadcast", shared['val3_vecs'][hi], self.scratch_const(val3)))
         body.append(("bundle", {"valu": valu_ops}))
+
+        # Broadcast multipliers for optimized hash stages (stages 0, 2, 4)
+        valu_ops = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if op1 == '+' and op2 == '+':
+                multiplier = (1 << val3) + 1
+                valu_ops.append(("vbroadcast", shared['hash_mul_vecs'][hi], self.scratch_const(multiplier)))
+        if valu_ops:
+            body.append(("bundle", {"valu": valu_ops}))
 
     # ========== Instruction Generation (Queue-based approach) ==========
 
@@ -322,16 +340,26 @@ class KernelBuilder:
         seq = 0
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            # Part 1: tmp1 = val op1 val1, tmp2 = val op3 val3
-            for v in range(num_vectors):
-                instrs.append(Instruction("valu", (op1, s['tmp1'][v], s['tmp_val'][v], shared['val1_vecs'][hi]), group, 1, round_num, seq))
-                instrs.append(Instruction("valu", (op3, s['tmp2'][v], s['tmp_val'][v], shared['val3_vecs'][hi]), group, 1, round_num, seq))
-            seq += 1
+            # Check if this stage can be optimized with multiply_add
+            # When op1='+' and op2='+': a' = (a + val1) + (a << val3) = a * ((1<<val3)+1) + val1
+            if op1 == '+' and op2 == '+':
+                # Optimized: single multiply_add instruction
+                # val = val * multiplier + val1
+                for v in range(num_vectors):
+                    instrs.append(Instruction("valu", ("multiply_add", s['tmp_val'][v], s['tmp_val'][v], shared['hash_mul_vecs'][hi], shared['val1_vecs'][hi]), group, 1, round_num, seq))
+                seq += 1
+            else:
+                # Original: 3 operations
+                # Part 1: tmp1 = val op1 val1, tmp2 = val op3 val3
+                for v in range(num_vectors):
+                    instrs.append(Instruction("valu", (op1, s['tmp1'][v], s['tmp_val'][v], shared['val1_vecs'][hi]), group, 1, round_num, seq))
+                    instrs.append(Instruction("valu", (op3, s['tmp2'][v], s['tmp_val'][v], shared['val3_vecs'][hi]), group, 1, round_num, seq))
+                seq += 1
 
-            # Part 2: val = tmp1 op2 tmp2
-            for v in range(num_vectors):
-                instrs.append(Instruction("valu", (op2, s['tmp_val'][v], s['tmp1'][v], s['tmp2'][v]), group, 1, round_num, seq))
-            seq += 1
+                # Part 2: val = tmp1 op2 tmp2
+                for v in range(num_vectors):
+                    instrs.append(Instruction("valu", (op2, s['tmp_val'][v], s['tmp1'][v], s['tmp2'][v]), group, 1, round_num, seq))
+                seq += 1
 
             # Debug compares after each stage
             for j, i in enumerate(group_items):
