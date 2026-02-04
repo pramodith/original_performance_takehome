@@ -350,14 +350,14 @@ class KernelBuilder:
             instrs.append(Instruction("valu", ("multiply_add", s['idx_plus_1'][v], s['tmp_idx'][v], shared['two_vec'], shared['one_vec']), group, 2, round_num, 0))
             instrs.append(Instruction("valu", ("multiply_add", s['idx_plus_2'][v], s['tmp_idx'][v], shared['two_vec'], shared['two_vec']), group, 2, round_num, 0))
 
-        # Flow ops: vselect (must come after valu)
+        # Flow ops: vselect (must come after valu, all same seq since flow limit is 1 anyway)
         for v in range(num_vectors):
-            instrs.append(Instruction("flow", ("vselect", s['tmp_idx'][v], s['tmp1'][v], s['idx_plus_2'][v], s['idx_plus_1'][v]), group, 2, round_num, 1 + v))
+            instrs.append(Instruction("flow", ("vselect", s['tmp_idx'][v], s['tmp1'][v], s['idx_plus_2'][v], s['idx_plus_1'][v]), group, 2, round_num, 1))
 
         # Debug compares
         for j, i in enumerate(group_items):
             v, vi = j // VLEN, j % VLEN
-            instrs.append(Instruction("debug", ("compare", s['tmp_idx'][v] + vi, (round_num, i, "next_idx")), group, 2, round_num, 1 + num_vectors))
+            instrs.append(Instruction("debug", ("compare", s['tmp_idx'][v] + vi, (round_num, i, "next_idx")), group, 2, round_num, 2))
 
         return instrs
 
@@ -369,14 +369,14 @@ class KernelBuilder:
         for v in range(num_vectors):
             instrs.append(Instruction("valu", ("<", s['tmp3'][v], s['tmp_idx'][v], shared['n_nodes_vec']), group, 3, round_num, 0))
 
-        # Flow ops: vselect (must come after valu)
+        # Flow ops: vselect (must come after valu, all same seq since flow limit is 1 anyway)
         for v in range(num_vectors):
-            instrs.append(Instruction("flow", ("vselect", s['tmp_idx'][v], s['tmp3'][v], s['tmp_idx'][v], shared['zero_vec']), group, 3, round_num, 1 + v))
+            instrs.append(Instruction("flow", ("vselect", s['tmp_idx'][v], s['tmp3'][v], s['tmp_idx'][v], shared['zero_vec']), group, 3, round_num, 1))
 
         # Debug compares
         for j, i in enumerate(group_items):
             v, vi = j // VLEN, j % VLEN
-            instrs.append(Instruction("debug", ("compare", s['tmp_idx'][v] + vi, (round_num, i, "wrapped_idx")), group, 3, round_num, 1 + num_vectors))
+            instrs.append(Instruction("debug", ("compare", s['tmp_idx'][v] + vi, (round_num, i, "wrapped_idx")), group, 3, round_num, 2))
 
         return instrs
 
@@ -414,27 +414,29 @@ class KernelBuilder:
                 break  # Slot full
         return idx, scheduled
 
-    def _schedule_instructions(self, instrs_A, instrs_B):
-        """Schedule instructions from both groups into bundles respecting slot limits and dependencies."""
+    def _schedule_instructions(self, *instr_lists):
+        """Schedule instructions from multiple groups into bundles respecting slot limits and dependencies."""
         bundles = []
 
         # Sort each group's instructions by (round, phase, seq)
-        instrs_A.sort(key=lambda i: (i.round, i.phase, i.seq))
-        instrs_B.sort(key=lambda i: (i.round, i.phase, i.seq))
+        for instrs in instr_lists:
+            instrs.sort(key=lambda i: (i.round, i.phase, i.seq))
 
-        idx_A, idx_B = 0, 0
+        indices = [0] * len(instr_lists)
 
-        while idx_A < len(instrs_A) or idx_B < len(instrs_B):
+        while any(indices[i] < len(instr_lists[i]) for i in range(len(instr_lists))):
             bundle = defaultdict(list)
+            any_scheduled = False
 
-            idx_A, scheduled_A = self._schedule_group(instrs_A, idx_A, bundle)
-            idx_B, scheduled_B = self._schedule_group(instrs_B, idx_B, bundle)
+            for i, instrs in enumerate(instr_lists):
+                indices[i], scheduled = self._schedule_group(instrs, indices[i], bundle)
+                any_scheduled = any_scheduled or scheduled
 
             out_bundle = {k: v for k, v in bundle.items() if v}
             if out_bundle:
                 bundles.append(("bundle", out_bundle))
 
-            if not (scheduled_A or scheduled_B):
+            if not any_scheduled:
                 break
 
         return bundles
@@ -485,49 +487,54 @@ class KernelBuilder:
         bundle_size = SLOT_LIMITS["load"] * VLEN  # 16 elements per cycle
         num_vectors = SLOT_LIMITS["load"]  # 2 vectors
 
-        # Allocate two sets of working vectors for pipelining
+        # Allocate three sets of working vectors for pipelining
         sA = self._alloc_scratch_vectors_for_set(num_vectors, 'A')
         sB = self._alloc_scratch_vectors_for_set(num_vectors, 'B')
+        sC = self._alloc_scratch_vectors_for_set(num_vectors, 'C')
         shared = self._alloc_shared_vectors(num_vectors)
 
         self._broadcast_constants(body, shared, zero_const, one_const, two_const)
 
-        # Process groups in pairs for pipelining
+        # Process groups in triplets for pipelining
         group_starts = list(range(0, batch_size, bundle_size))
         num_groups = len(group_starts)
 
-        for pair_idx in range(0, num_groups, 2):
-            group_start_A = group_starts[pair_idx]
-            group_start_B = group_starts[pair_idx + 1]
-            group_items_A = list(range(group_start_A, min(group_start_A + bundle_size, batch_size)))
-            group_items_B = list(range(group_start_B, min(group_start_B + bundle_size, batch_size)))
+        for triplet_idx in range(0, num_groups, 3):
+            # Determine which groups are in this triplet
+            active_groups = []
+            for offset, s in enumerate([sA, sB, sC]):
+                group_idx = triplet_idx + offset
+                if group_idx < num_groups:
+                    group_start = group_starts[group_idx]
+                    group_items = list(range(group_start, min(group_start + bundle_size, batch_size)))
+                    active_groups.append((s, group_start, group_items, chr(ord('A') + offset)))
 
-            # Compute addresses for both groups in one ALU bundle
+            # Compute addresses for all active groups
             alu_ops = []
-            self._compute_load_addresses(alu_ops, sA, group_start_A, num_vectors)
-            self._compute_load_addresses(alu_ops, sB, group_start_B, num_vectors)
+            for s, group_start, group_items, name in active_groups:
+                self._compute_load_addresses(alu_ops, s, group_start, num_vectors)
             body.append(("bundle", {"alu": alu_ops}))
 
-            # Load idx and val for both groups
-            self._emit_group_loads(body, sA, num_vectors)
-            self._emit_group_loads(body, sB, num_vectors)
+            # Load idx and val for all active groups
+            for s, group_start, group_items, name in active_groups:
+                self._emit_group_loads(body, s, num_vectors)
 
-            # Generate all instructions for both groups across all rounds
-            instrs_A = []
-            instrs_B = []
-            for round_num in range(rounds):
-                instrs_A.extend(self._gen_round_instrs(sA, shared, "A", round_num, num_vectors, group_items_A))
-                instrs_B.extend(self._gen_round_instrs(sB, shared, "B", round_num, num_vectors, group_items_B))
+            # Generate instructions for all active groups across all rounds
+            instr_lists = []
+            for s, group_start, group_items, name in active_groups:
+                instrs = []
+                for round_num in range(rounds):
+                    instrs.extend(self._gen_round_instrs(s, shared, name, round_num, num_vectors, group_items))
+                instr_lists.append(instrs)
 
             # Schedule instructions into bundles
-            scheduled = self._schedule_instructions(instrs_A, instrs_B)
+            scheduled = self._schedule_instructions(*instr_lists)
             body.extend(scheduled)
 
-            # Store results for both groups
-            body.append(("bundle", {"store": [("vstore", sA['vload_addr_idx'][v], sA['tmp_idx'][v]) for v in range(num_vectors)]}))
-            body.append(("bundle", {"store": [("vstore", sA['vload_addr_val'][v], sA['tmp_val'][v]) for v in range(num_vectors)]}))
-            body.append(("bundle", {"store": [("vstore", sB['vload_addr_idx'][v], sB['tmp_idx'][v]) for v in range(num_vectors)]}))
-            body.append(("bundle", {"store": [("vstore", sB['vload_addr_val'][v], sB['tmp_val'][v]) for v in range(num_vectors)]}))
+            # Store results for all active groups
+            for s, group_start, group_items, name in active_groups:
+                body.append(("bundle", {"store": [("vstore", s['vload_addr_idx'][v], s['tmp_idx'][v]) for v in range(num_vectors)]}))
+                body.append(("bundle", {"store": [("vstore", s['vload_addr_val'][v], s['tmp_val'][v]) for v in range(num_vectors)]}))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
