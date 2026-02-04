@@ -395,63 +395,46 @@ class KernelBuilder:
         instrs.extend(self._gen_wrap_instrs(s, shared, group, round_num, num_vectors, group_items))
         return instrs
 
-    def _schedule_instructions(self, instrs_A, instrs_B):
-        """Schedule instructions from both groups into bundles respecting slot limits and dependencies.
+    def _schedule_group(self, instrs, idx, bundle):
+        """Schedule instructions from one group into a bundle. Returns (new_idx, scheduled_any)."""
+        scheduled = False
+        while idx < len(instrs):
+            instr = instrs[idx]
+            limit = SLOT_LIMITS.get(instr.engine, 1)
+            if len(bundle[instr.engine]) < limit:
+                bundle[instr.engine].append(instr.op)
+                idx += 1
+                scheduled = True
+                # Check if next instruction has same (round, phase, seq) - can schedule together
+                if idx < len(instrs):
+                    next_instr = instrs[idx]
+                    if (next_instr.round, next_instr.phase, next_instr.seq) != (instr.round, instr.phase, instr.seq):
+                        break  # Different seq - wait for next cycle
+            else:
+                break  # Slot full
+        return idx, scheduled
 
-        Dependencies: within a group, instructions must execute in (round, phase, seq) order.
-        Between groups A and B, there are no data dependencies - only resource constraints.
-        """
+    def _schedule_instructions(self, instrs_A, instrs_B):
+        """Schedule instructions from both groups into bundles respecting slot limits and dependencies."""
         bundles = []
 
         # Sort each group's instructions by (round, phase, seq)
         instrs_A.sort(key=lambda i: (i.round, i.phase, i.seq))
         instrs_B.sort(key=lambda i: (i.round, i.phase, i.seq))
 
-        # Track next instruction index for each group (independent progress)
         idx_A, idx_B = 0, 0
 
         while idx_A < len(instrs_A) or idx_B < len(instrs_B):
             bundle = defaultdict(list)
-            any_scheduled = False
 
-            # Process group A - schedule as many ready instructions as possible
-            while idx_A < len(instrs_A):
-                instr = instrs_A[idx_A]
-                limit = SLOT_LIMITS.get(instr.engine, 1)
-                if len(bundle[instr.engine]) < limit:
-                    bundle[instr.engine].append(instr.op)
-                    idx_A += 1
-                    any_scheduled = True
-                    # Check if next instruction has same (round, phase, seq) - can schedule together
-                    if idx_A < len(instrs_A):
-                        next_instr = instrs_A[idx_A]
-                        if (next_instr.round, next_instr.phase, next_instr.seq) != (instr.round, instr.phase, instr.seq):
-                            break  # Different seq - wait for next cycle
-                else:
-                    break  # Slot full
+            idx_A, scheduled_A = self._schedule_group(instrs_A, idx_A, bundle)
+            idx_B, scheduled_B = self._schedule_group(instrs_B, idx_B, bundle)
 
-            # Process group B - schedule as many ready instructions as possible
-            while idx_B < len(instrs_B):
-                instr = instrs_B[idx_B]
-                limit = SLOT_LIMITS.get(instr.engine, 1)
-                if len(bundle[instr.engine]) < limit:
-                    bundle[instr.engine].append(instr.op)
-                    idx_B += 1
-                    any_scheduled = True
-                    # Check if next instruction has same (round, phase, seq) - can schedule together
-                    if idx_B < len(instrs_B):
-                        next_instr = instrs_B[idx_B]
-                        if (next_instr.round, next_instr.phase, next_instr.seq) != (instr.round, instr.phase, instr.seq):
-                            break  # Different seq - wait for next cycle
-                else:
-                    break  # Slot full
-
-            # Convert bundle to output format
             out_bundle = {k: v for k, v in bundle.items() if v}
             if out_bundle:
                 bundles.append(("bundle", out_bundle))
 
-            if not any_scheduled:
+            if not (scheduled_A or scheduled_B):
                 break
 
         return bundles
