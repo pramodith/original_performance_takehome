@@ -17,6 +17,7 @@ We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
+from dataclasses import dataclass, field
 import random
 import unittest
 
@@ -35,6 +36,18 @@ from problem import (
     build_mem_image,
     reference_kernel2,
 )
+
+
+@dataclass
+class Instruction:
+    """A single instruction with dependency tracking for scheduling."""
+    engine: str           # "valu", "load", "flow", "alu", "store", "debug"
+    op: tuple             # The actual operation tuple
+    group: str            # "A" or "B"
+    phase: int            # Dependency ordering within a round (0=gather, 1=hash, 2=branch, 3=wrap)
+    round: int            # Which round this instruction belongs to
+    seq: int = 0          # Sequence number within phase for ordering
+    scheduled: bool = field(default=False, repr=False)
 
 
 class KernelBuilder:
@@ -268,249 +281,180 @@ class KernelBuilder:
             valu_ops.append(("vbroadcast", shared['val3_vecs'][hi], self.scratch_const(val3)))
         body.append(("bundle", {"valu": valu_ops}))
 
-    def _build_gather_round0(self, body, s, shared, num_vectors):
-        """Optimized gather for round 0 where all indices are 0.
+    # ========== Instruction Generation (Queue-based approach) ==========
 
-        Instead of 8 individual loads, we load the root value once and broadcast.
-        """
-        # Load forest_values[0] (root node) - address is just forest_values_p
-        # Use tmp_addr[0] as a temporary scalar location
-        body.append(("bundle", {"load": [("load", s['tmp_addr'][0], self.scratch["forest_values_p"])]}))
+    def _gen_gather_instrs(self, s, shared, group, round_num, num_vectors, group_items):
+        """Generate gather instructions for one group's round."""
+        instrs = []
+        seq = 0
 
-        # Broadcast root value to all tmp_node_val vectors
-        valu_ops = [("vbroadcast", s['tmp_node_val'][v], s['tmp_addr'][0]) for v in range(num_vectors)]
-        body.append(("bundle", {"valu": valu_ops}))
-
-        # XOR with tmp_val
-        valu_ops = [("^", s['tmp_val'][v], s['tmp_val'][v], s['tmp_node_val'][v]) for v in range(num_vectors)]
-        body.append(("bundle", {"valu": valu_ops}))
-
-    def _compute_gather_addr_ops(self, valu_ops, s, shared, num_vectors):
-        """Add valu ops for gather address computation: forest_values_p + idx."""
-        for v in range(num_vectors):
-            valu_ops.append(("+", s['tmp_addr'][v], s['tmp_idx'][v], shared['forest_values_p_vec']))
-
-    def _build_gather_addr_compute(self, body, s, shared, num_vectors):
-        """Compute gather addresses: forest_values_p + idx."""
-        valu_ops = []
-        self._compute_gather_addr_ops(valu_ops, s, shared, num_vectors)
-        body.append(("bundle", {"valu": valu_ops}))
-
-    def _build_gather_loads(self, s, num_vectors):
-        """Generate list of load operations for gathering node values.
-
-        Returns list of (load_op, load_op) tuples, one per cycle.
-        """
-        load_cycles = []
-        num_elements = num_vectors * VLEN
-        for load_start in range(0, num_elements, SLOT_LIMITS["load"]):
-            load_end = min(load_start + SLOT_LIMITS["load"], num_elements)
-            load_ops = []
-            for li in range(load_start, load_end):
+        if round_num == 0:
+            # Round 0: load root and broadcast
+            instrs.append(Instruction("load", ("load", s['tmp_addr'][0], self.scratch["forest_values_p"]), group, 0, round_num, seq)); seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("vbroadcast", s['tmp_node_val'][v], s['tmp_addr'][0]), group, 0, round_num, seq))
+            seq += 1
+        else:
+            # Rounds 1+: compute addresses and load individually
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("+", s['tmp_addr'][v], s['tmp_idx'][v], shared['forest_values_p_vec']), group, 0, round_num, seq))
+            seq += 1
+            # Individual loads (grouped by slot limit)
+            for li in range(num_vectors * VLEN):
                 v, vi = li // VLEN, li % VLEN
-                load_ops.append(("load", s['tmp_node_val'][v] + vi, s['tmp_addr'][v] + vi))
-            load_cycles.append(load_ops)
-        return load_cycles
+                instrs.append(Instruction("load", ("load", s['tmp_node_val'][v] + vi, s['tmp_addr'][v] + vi), group, 0, round_num, seq + li // SLOT_LIMITS["load"]))
+            seq += (num_vectors * VLEN + SLOT_LIMITS["load"] - 1) // SLOT_LIMITS["load"]
 
-    def _build_gather_xor(self, body, s, num_vectors):
-        """XOR gathered node values with tmp_val."""
-        valu_ops = [("^", s['tmp_val'][v], s['tmp_val'][v], s['tmp_node_val'][v]) for v in range(num_vectors)]
-        body.append(("bundle", {"valu": valu_ops}))
+        # XOR: val = val ^ node_val
+        for v in range(num_vectors):
+            instrs.append(Instruction("valu", ("^", s['tmp_val'][v], s['tmp_val'][v], s['tmp_node_val'][v]), group, 0, round_num, seq))
 
-    def _build_gather_node_values(self, body, s, shared, group_items, num_vectors):
-        """Build gather operation to load node values from tree (non-contiguous addresses).
+        # Debug compares
+        for j, i in enumerate(group_items):
+            v, vi = j // VLEN, j % VLEN
+            instrs.append(Instruction("debug", ("compare", s['tmp_node_val'][v] + vi, (round_num, i, "node_val")), group, 0, round_num, seq + 1))
 
-        Overlaps XOR of vector 0 with loading of vector 1 to hide XOR latency.
-        XOR of vector 1 is done after all loads complete.
-        """
-        self._build_gather_addr_compute(body, s, shared, num_vectors)
+        return instrs
 
-        # Individual loads in groups of 2 (load slot limit)
-        loads_per_vector = VLEN // SLOT_LIMITS["load"]  # 4 cycles to load one vector
-        load_cycles = self._build_gather_loads(s, num_vectors)
+    def _gen_hash_instrs(self, s, shared, group, round_num, num_vectors, group_items):
+        """Generate hash instructions for one group's round."""
+        instrs = []
+        seq = 0
 
-        for load_cycle, load_ops in enumerate(load_cycles):
-            # On cycle 4 (first cycle of loading vector 1), XOR the completed vector 0
-            if load_cycle > 0 and load_cycle % loads_per_vector == 0:
-                completed_vec = (load_cycle // loads_per_vector) - 1
-                valu_ops = [("^", s['tmp_val'][completed_vec], s['tmp_val'][completed_vec], s['tmp_node_val'][completed_vec])]
-                body.append(("bundle", {"load": load_ops, "valu": valu_ops}))
-            else:
-                body.append(("bundle", {"load": load_ops}))
-
-        # XOR last vector
-        valu_ops = [("^", s['tmp_val'][num_vectors-1], s['tmp_val'][num_vectors-1], s['tmp_node_val'][num_vectors-1])]
-        body.append(("bundle", {"valu": valu_ops}))
-
-    def _build_hash_stages(self, body, s, shared, num_vectors, group_items, round):
-        """Build the 6-stage hash computation: val = myhash(val ^ node_val).
-
-        All XORs are done in the gather phase before this function is called.
-        """
-        # Apply 6 hash stages (constants already broadcast)
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            # Fused: tmp1 = val op1 val1, tmp2 = val op3 val3 (independent)
-            valu_ops = []
+            # Part 1: tmp1 = val op1 val1, tmp2 = val op3 val3
             for v in range(num_vectors):
-                valu_ops.append((op1, s['tmp1'][v], s['tmp_val'][v], shared['val1_vecs'][hi]))
-                valu_ops.append((op3, s['tmp2'][v], s['tmp_val'][v], shared['val3_vecs'][hi]))
-            body.append(("bundle", {"valu": valu_ops}))
+                instrs.append(Instruction("valu", (op1, s['tmp1'][v], s['tmp_val'][v], shared['val1_vecs'][hi]), group, 1, round_num, seq))
+                instrs.append(Instruction("valu", (op3, s['tmp2'][v], s['tmp_val'][v], shared['val3_vecs'][hi]), group, 1, round_num, seq))
+            seq += 1
 
-            # val = tmp1 op2 tmp2
-            valu_ops = []
+            # Part 2: val = tmp1 op2 tmp2
             for v in range(num_vectors):
-                valu_ops.append((op2, s['tmp_val'][v], s['tmp1'][v], s['tmp2'][v]))
-            body.append(("bundle", {"valu": valu_ops}))
+                instrs.append(Instruction("valu", (op2, s['tmp_val'][v], s['tmp1'][v], s['tmp2'][v]), group, 1, round_num, seq))
+            seq += 1
 
-            # Debug compare after each stage
+            # Debug compares after each stage
             for j, i in enumerate(group_items):
                 v, vi = j // VLEN, j % VLEN
-                body.append(("debug", ("compare", s['tmp_val'][v] + vi, (round, i, "hash_stage", hi))))
+                instrs.append(Instruction("debug", ("compare", s['tmp_val'][v] + vi, (round_num, i, "hash_stage", hi)), group, 1, round_num, seq))
 
-    def _build_hash_stages_with_loads(self, body, s, shared, num_vectors, group_items, round, load_ops_list):
-        """Build hash stages with interleaved load operations from another group.
+        return instrs
 
-        Args:
-            load_ops_list: List of load operation lists to interleave (one per available cycle)
+    def _gen_branch_instrs(self, s, shared, group, round_num, num_vectors, group_items):
+        """Generate branch instructions for one group's round."""
+        instrs = []
+
+        # Valu ops: tmp1 = val%2, idx_plus_1 = 2*idx+1, idx_plus_2 = 2*idx+2
+        for v in range(num_vectors):
+            instrs.append(Instruction("valu", ("%", s['tmp1'][v], s['tmp_val'][v], shared['two_vec']), group, 2, round_num, 0))
+            instrs.append(Instruction("valu", ("multiply_add", s['idx_plus_1'][v], s['tmp_idx'][v], shared['two_vec'], shared['one_vec']), group, 2, round_num, 0))
+            instrs.append(Instruction("valu", ("multiply_add", s['idx_plus_2'][v], s['tmp_idx'][v], shared['two_vec'], shared['two_vec']), group, 2, round_num, 0))
+
+        # Flow ops: vselect (must come after valu)
+        for v in range(num_vectors):
+            instrs.append(Instruction("flow", ("vselect", s['tmp_idx'][v], s['tmp1'][v], s['idx_plus_2'][v], s['idx_plus_1'][v]), group, 2, round_num, 1 + v))
+
+        # Debug compares
+        for j, i in enumerate(group_items):
+            v, vi = j // VLEN, j % VLEN
+            instrs.append(Instruction("debug", ("compare", s['tmp_idx'][v] + vi, (round_num, i, "next_idx")), group, 2, round_num, 1 + num_vectors))
+
+        return instrs
+
+    def _gen_wrap_instrs(self, s, shared, group, round_num, num_vectors, group_items):
+        """Generate wrap instructions for one group's round."""
+        instrs = []
+
+        # Valu ops: tmp3 = idx < n_nodes
+        for v in range(num_vectors):
+            instrs.append(Instruction("valu", ("<", s['tmp3'][v], s['tmp_idx'][v], shared['n_nodes_vec']), group, 3, round_num, 0))
+
+        # Flow ops: vselect (must come after valu)
+        for v in range(num_vectors):
+            instrs.append(Instruction("flow", ("vselect", s['tmp_idx'][v], s['tmp3'][v], s['tmp_idx'][v], shared['zero_vec']), group, 3, round_num, 1 + v))
+
+        # Debug compares
+        for j, i in enumerate(group_items):
+            v, vi = j // VLEN, j % VLEN
+            instrs.append(Instruction("debug", ("compare", s['tmp_idx'][v] + vi, (round_num, i, "wrapped_idx")), group, 3, round_num, 1 + num_vectors))
+
+        return instrs
+
+    def _gen_round_instrs(self, s, shared, group, round_num, num_vectors, group_items):
+        """Generate all instructions for one group's round."""
+        instrs = []
+        # Debug compares for idx and val at start of round
+        for j, i in enumerate(group_items):
+            v, vi = j // VLEN, j % VLEN
+            instrs.append(Instruction("debug", ("compare", s['tmp_idx'][v] + vi, (round_num, i, "idx")), group, 0, round_num, -1))
+            instrs.append(Instruction("debug", ("compare", s['tmp_val'][v] + vi, (round_num, i, "val")), group, 0, round_num, -1))
+
+        instrs.extend(self._gen_gather_instrs(s, shared, group, round_num, num_vectors, group_items))
+        instrs.extend(self._gen_hash_instrs(s, shared, group, round_num, num_vectors, group_items))
+        instrs.extend(self._gen_branch_instrs(s, shared, group, round_num, num_vectors, group_items))
+        instrs.extend(self._gen_wrap_instrs(s, shared, group, round_num, num_vectors, group_items))
+        return instrs
+
+    def _schedule_instructions(self, instrs_A, instrs_B):
+        """Schedule instructions from both groups into bundles respecting slot limits and dependencies.
+
+        Dependencies: within a group, instructions must execute in (round, phase, seq) order.
+        Between groups A and B, there are no data dependencies - only resource constraints.
         """
-        load_idx = 0
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            # Fused: tmp1 = val op1 val1, tmp2 = val op3 val3 (independent)
-            valu_ops = []
-            for v in range(num_vectors):
-                valu_ops.append((op1, s['tmp1'][v], s['tmp_val'][v], shared['val1_vecs'][hi]))
-                valu_ops.append((op3, s['tmp2'][v], s['tmp_val'][v], shared['val3_vecs'][hi]))
+        bundles = []
 
-            # Add load ops if available
-            if load_idx < len(load_ops_list):
-                body.append(("bundle", {"valu": valu_ops, "load": load_ops_list[load_idx]}))
-                load_idx += 1
-            else:
-                body.append(("bundle", {"valu": valu_ops}))
+        # Sort each group's instructions by (round, phase, seq)
+        instrs_A.sort(key=lambda i: (i.round, i.phase, i.seq))
+        instrs_B.sort(key=lambda i: (i.round, i.phase, i.seq))
 
-            # val = tmp1 op2 tmp2
-            valu_ops = []
-            for v in range(num_vectors):
-                valu_ops.append((op2, s['tmp_val'][v], s['tmp1'][v], s['tmp2'][v]))
+        # Track next instruction index for each group (independent progress)
+        idx_A, idx_B = 0, 0
 
-            if load_idx < len(load_ops_list):
-                body.append(("bundle", {"valu": valu_ops, "load": load_ops_list[load_idx]}))
-                load_idx += 1
-            else:
-                body.append(("bundle", {"valu": valu_ops}))
+        while idx_A < len(instrs_A) or idx_B < len(instrs_B):
+            bundle = defaultdict(list)
+            any_scheduled = False
 
-            # Debug compare after each stage
-            for j, i in enumerate(group_items):
-                v, vi = j // VLEN, j % VLEN
-                body.append(("debug", ("compare", s['tmp_val'][v] + vi, (round, i, "hash_stage", hi))))
+            # Process group A - schedule as many ready instructions as possible
+            while idx_A < len(instrs_A):
+                instr = instrs_A[idx_A]
+                limit = SLOT_LIMITS.get(instr.engine, 1)
+                if len(bundle[instr.engine]) < limit:
+                    bundle[instr.engine].append(instr.op)
+                    idx_A += 1
+                    any_scheduled = True
+                    # Check if next instruction has same (round, phase, seq) - can schedule together
+                    if idx_A < len(instrs_A):
+                        next_instr = instrs_A[idx_A]
+                        if (next_instr.round, next_instr.phase, next_instr.seq) != (instr.round, instr.phase, instr.seq):
+                            break  # Different seq - wait for next cycle
+                else:
+                    break  # Slot full
 
-    def _build_branch_computation(self, body, s, shared, num_vectors):
-        """Build: idx = 2*idx + (1 if val%2==0 else 2)."""
-        # Fused: tmp1 = val % 2, idx_plus_1 = 2*idx+1, idx_plus_2 = 2*idx+2
-        valu_ops = []
-        for v in range(num_vectors):
-            valu_ops.append(("%", s['tmp1'][v], s['tmp_val'][v], shared['two_vec']))
-            valu_ops.append(("multiply_add", s['idx_plus_1'][v], s['tmp_idx'][v], shared['two_vec'], shared['one_vec']))
-            valu_ops.append(("multiply_add", s['idx_plus_2'][v], s['tmp_idx'][v], shared['two_vec'], shared['two_vec']))
-        body.append(("bundle", {"valu": valu_ops}))
+            # Process group B - schedule as many ready instructions as possible
+            while idx_B < len(instrs_B):
+                instr = instrs_B[idx_B]
+                limit = SLOT_LIMITS.get(instr.engine, 1)
+                if len(bundle[instr.engine]) < limit:
+                    bundle[instr.engine].append(instr.op)
+                    idx_B += 1
+                    any_scheduled = True
+                    # Check if next instruction has same (round, phase, seq) - can schedule together
+                    if idx_B < len(instrs_B):
+                        next_instr = instrs_B[idx_B]
+                        if (next_instr.round, next_instr.phase, next_instr.seq) != (instr.round, instr.phase, instr.seq):
+                            break  # Different seq - wait for next cycle
+                else:
+                    break  # Slot full
 
-        # Select: if even (tmp1=0) pick idx_plus_1, if odd (tmp1=1) pick idx_plus_2
-        for v in range(num_vectors):
-            body.append(("flow", ("vselect", s['tmp_idx'][v], s['tmp1'][v], s['idx_plus_2'][v], s['idx_plus_1'][v])))
+            # Convert bundle to output format
+            out_bundle = {k: v for k, v in bundle.items() if v}
+            if out_bundle:
+                bundles.append(("bundle", out_bundle))
 
-    def _build_branch_computation_with_loads(self, body, s, shared, num_vectors, load_ops_list, load_start_idx):
-        """Build branch computation with interleaved loads. Returns next load index."""
-        load_idx = load_start_idx
+            if not any_scheduled:
+                break
 
-        # Fused: tmp1 = val % 2, idx_plus_1 = 2*idx+1, idx_plus_2 = 2*idx+2
-        valu_ops = []
-        for v in range(num_vectors):
-            valu_ops.append(("%", s['tmp1'][v], s['tmp_val'][v], shared['two_vec']))
-            valu_ops.append(("multiply_add", s['idx_plus_1'][v], s['tmp_idx'][v], shared['two_vec'], shared['one_vec']))
-            valu_ops.append(("multiply_add", s['idx_plus_2'][v], s['tmp_idx'][v], shared['two_vec'], shared['two_vec']))
-
-        if load_idx < len(load_ops_list):
-            body.append(("bundle", {"valu": valu_ops, "load": load_ops_list[load_idx]}))
-            load_idx += 1
-        else:
-            body.append(("bundle", {"valu": valu_ops}))
-
-        # Select: if even (tmp1=0) pick idx_plus_1, if odd (tmp1=1) pick idx_plus_2
-        for v in range(num_vectors):
-            if load_idx < len(load_ops_list):
-                body.append(("bundle", {"flow": [("vselect", s['tmp_idx'][v], s['tmp1'][v], s['idx_plus_2'][v], s['idx_plus_1'][v])], "load": load_ops_list[load_idx]}))
-                load_idx += 1
-            else:
-                body.append(("flow", ("vselect", s['tmp_idx'][v], s['tmp1'][v], s['idx_plus_2'][v], s['idx_plus_1'][v])))
-
-        return load_idx
-
-    def _build_wrap_check(self, body, s, shared, num_vectors):
-        """Build: idx = 0 if idx >= n_nodes else idx."""
-        # tmp3 = idx < n_nodes (use tmp3 to avoid conflict with branch's tmp1)
-        valu_ops = []
-        for v in range(num_vectors):
-            valu_ops.append(("<", s['tmp3'][v], s['tmp_idx'][v], shared['n_nodes_vec']))
-        body.append(("bundle", {"valu": valu_ops}))
-
-        # idx = select(tmp3, idx, 0)
-        for v in range(num_vectors):
-            body.append(("flow", ("vselect", s['tmp_idx'][v], s['tmp3'][v], s['tmp_idx'][v], shared['zero_vec'])))
-
-    def _build_wrap_check_with_loads(self, body, s, shared, num_vectors, load_ops_list, load_start_idx):
-        """Build wrap check with interleaved loads. Returns next load index."""
-        load_idx = load_start_idx
-
-        # tmp3 = idx < n_nodes (use tmp3 to avoid conflict with branch's tmp1)
-        valu_ops = []
-        for v in range(num_vectors):
-            valu_ops.append(("<", s['tmp3'][v], s['tmp_idx'][v], shared['n_nodes_vec']))
-
-        if load_idx < len(load_ops_list):
-            body.append(("bundle", {"valu": valu_ops, "load": load_ops_list[load_idx]}))
-            load_idx += 1
-        else:
-            body.append(("bundle", {"valu": valu_ops}))
-
-        # idx = select(tmp3, idx, 0)
-        for v in range(num_vectors):
-            if load_idx < len(load_ops_list):
-                body.append(("bundle", {"flow": [("vselect", s['tmp_idx'][v], s['tmp3'][v], s['tmp_idx'][v], shared['zero_vec'])], "load": load_ops_list[load_idx]}))
-                load_idx += 1
-            else:
-                body.append(("flow", ("vselect", s['tmp_idx'][v], s['tmp3'][v], s['tmp_idx'][v], shared['zero_vec'])))
-
-        return load_idx
-
-    def _get_branch_valu_ops(self, s, shared, num_vectors):
-        """Get valu ops for branch computation: tmp1 = val%2, idx_plus_1 = 2*idx+1, idx_plus_2 = 2*idx+2."""
-        valu_ops = []
-        for v in range(num_vectors):
-            valu_ops.append(("%", s['tmp1'][v], s['tmp_val'][v], shared['two_vec']))
-            valu_ops.append(("multiply_add", s['idx_plus_1'][v], s['tmp_idx'][v], shared['two_vec'], shared['one_vec']))
-            valu_ops.append(("multiply_add", s['idx_plus_2'][v], s['tmp_idx'][v], shared['two_vec'], shared['two_vec']))
-        return valu_ops
-
-    def _get_branch_flow_ops(self, s, num_vectors):
-        """Get flow ops for branch: vselect based on tmp1."""
-        flow_ops = []
-        for v in range(num_vectors):
-            flow_ops.append(("vselect", s['tmp_idx'][v], s['tmp1'][v], s['idx_plus_2'][v], s['idx_plus_1'][v]))
-        return flow_ops
-
-    def _get_wrap_valu_ops(self, s, shared, num_vectors):
-        """Get valu ops for wrap check: tmp3 = idx < n_nodes."""
-        valu_ops = []
-        for v in range(num_vectors):
-            valu_ops.append(("<", s['tmp3'][v], s['tmp_idx'][v], shared['n_nodes_vec']))
-        return valu_ops
-
-    def _get_wrap_flow_ops(self, s, shared, num_vectors):
-        """Get flow ops for wrap: vselect based on tmp3."""
-        flow_ops = []
-        for v in range(num_vectors):
-            flow_ops.append(("vselect", s['tmp_idx'][v], s['tmp3'][v], s['tmp_idx'][v], shared['zero_vec']))
-        return flow_ops
+        return bundles
 
     def _compute_load_addresses(self, alu_ops, s, group_start, num_vectors):
         """Add ALU ops to compute vload addresses for a group.
@@ -537,314 +481,6 @@ class KernelBuilder:
         """
         body.append(("bundle", {"load": [("vload", s['tmp_idx'][v], s['vload_addr_idx'][v]) for v in range(num_vectors)]}))
         body.append(("bundle", {"load": [("vload", s['tmp_val'][v], s['vload_addr_val'][v]) for v in range(num_vectors)]}))
-
-
-    def _build_debug_compares(self, body, s, group_items, round, tag):
-        """Build debug compare instructions for verification."""
-        for j, i in enumerate(group_items):
-            v, vi = j // VLEN, j % VLEN
-            if tag == "idx":
-                body.append(("debug", ("compare", s['tmp_idx'][v] + vi, (round, i, tag))))
-            elif tag == "val" or tag == "hashed_val":
-                body.append(("debug", ("compare", s['tmp_val'][v] + vi, (round, i, tag))))
-            elif tag == "node_val":
-                body.append(("debug", ("compare", s['tmp_node_val'][v] + vi, (round, i, tag))))
-            elif tag == "next_idx" or tag == "wrapped_idx":
-                body.append(("debug", ("compare", s['tmp_idx'][v] + vi, (round, i, tag))))
-
-    def _process_group_round0(self, body, s, shared, group_items, num_vectors, round):
-        """Process a single group through round 0 (broadcast optimization)."""
-        self._build_gather_round0(body, s, shared, num_vectors)
-        self._build_debug_compares(body, s, group_items, round, "node_val")
-
-        self._build_hash_stages(body, s, shared, num_vectors, group_items, round)
-        self._build_debug_compares(body, s, group_items, round, "hashed_val")
-
-        self._build_branch_computation(body, s, shared, num_vectors)
-        self._build_debug_compares(body, s, group_items, round, "next_idx")
-
-        self._build_wrap_check(body, s, shared, num_vectors)
-        self._build_debug_compares(body, s, group_items, round, "wrapped_idx")
-
-    def _process_group_pair_pipelined(self, body, sA, sB, shared, group_items_A, group_items_B, num_vectors, rounds):
-        """Process two groups with pipelined execution - overlap B's gather with A's compute, and interleave A's flow ops with B's valu ops."""
-        for round in range(rounds):
-            # Debug compares for both groups
-            self._build_debug_compares(body, sA, group_items_A, round, "idx")
-            self._build_debug_compares(body, sA, group_items_A, round, "val")
-            self._build_debug_compares(body, sB, group_items_B, round, "idx")
-            self._build_debug_compares(body, sB, group_items_B, round, "val")
-
-            if round == 0:
-                # Round 0: use broadcast optimization for both groups
-                # But still interleave A's flow ops with B's hash for efficiency
-
-                # A: gather (load root and broadcast), XOR
-                self._build_gather_round0(body, sA, shared, num_vectors)
-                self._build_debug_compares(body, sA, group_items_A, round, "node_val")
-
-                # A: hash stages (no B loads to interleave in round 0)
-                self._build_hash_stages(body, sA, shared, num_vectors, group_items_A, round)
-                self._build_debug_compares(body, sA, group_items_A, round, "hashed_val")
-
-                # Interleave A's flow ops with B's gather and hash start
-                branch_flow_A = self._get_branch_flow_ops(sA, num_vectors)
-                wrap_flow_A = self._get_wrap_flow_ops(sA, shared, num_vectors)
-
-                # A: branch valu
-                branch_valu_A = self._get_branch_valu_ops(sA, shared, num_vectors)
-                body.append(("bundle", {"valu": branch_valu_A}))
-
-                # B: gather round 0 (load + broadcast + XOR = 3 cycles)
-                # We can interleave A's branch flow with B's gather
-                # Load forest_values[0] + A branch flow[0]
-                body.append(("bundle", {"load": [("load", sB['tmp_addr'][0], self.scratch["forest_values_p"])], "flow": [branch_flow_A[0]]}))
-
-                # Broadcast to all B tmp_node_val + A branch flow[1]
-                valu_ops = [("vbroadcast", sB['tmp_node_val'][v], sB['tmp_addr'][0]) for v in range(num_vectors)]
-                body.append(("bundle", {"valu": valu_ops, "flow": [branch_flow_A[1]]}))
-                self._build_debug_compares(body, sA, group_items_A, round, "next_idx")
-
-                # B: XOR + A wrap valu
-                xor_valu_B = [("^", sB['tmp_val'][v], sB['tmp_val'][v], sB['tmp_node_val'][v]) for v in range(num_vectors)]
-                wrap_valu_A = self._get_wrap_valu_ops(sA, shared, num_vectors)
-                body.append(("bundle", {"valu": xor_valu_B + wrap_valu_A}))
-                self._build_debug_compares(body, sB, group_items_B, round, "node_val")
-
-                # Build B's hash valu ops for interleaving with A's wrap flow
-                b_hash_valu_ops = []
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    valu1 = []
-                    for v in range(num_vectors):
-                        valu1.append((op1, sB['tmp1'][v], sB['tmp_val'][v], shared['val1_vecs'][hi]))
-                        valu1.append((op3, sB['tmp2'][v], sB['tmp_val'][v], shared['val3_vecs'][hi]))
-                    b_hash_valu_ops.append(('valu1', hi, valu1))
-                    valu2 = []
-                    for v in range(num_vectors):
-                        valu2.append((op2, sB['tmp_val'][v], sB['tmp1'][v], sB['tmp2'][v]))
-                    b_hash_valu_ops.append(('valu2', hi, valu2))
-
-                b_hash_idx = 0
-
-                # A: wrap flow[0] + B: hash stage 0 part 1
-                _, _, b_valu = b_hash_valu_ops[b_hash_idx]
-                body.append(("bundle", {"flow": [wrap_flow_A[0]], "valu": b_valu}))
-                b_hash_idx += 1
-
-                # A: wrap flow[1] + B: hash stage 0 part 2
-                _, hi, b_valu = b_hash_valu_ops[b_hash_idx]
-                body.append(("bundle", {"flow": [wrap_flow_A[1]], "valu": b_valu}))
-                b_hash_idx += 1
-                for j, i in enumerate(group_items_B):
-                    vv, vi = j // VLEN, j % VLEN
-                    body.append(("debug", ("compare", sB['tmp_val'][vv] + vi, (round, i, "hash_stage", hi))))
-                self._build_debug_compares(body, sA, group_items_A, round, "wrapped_idx")
-
-                # Continue B's remaining hash stages
-                while b_hash_idx < len(b_hash_valu_ops):
-                    _, hi, b_valu = b_hash_valu_ops[b_hash_idx]
-                    body.append(("bundle", {"valu": b_valu}))
-                    b_hash_idx += 1
-                    if b_hash_valu_ops[b_hash_idx-1][0] == 'valu2':
-                        for j, i in enumerate(group_items_B):
-                            vv, vi = j // VLEN, j % VLEN
-                            body.append(("debug", ("compare", sB['tmp_val'][vv] + vi, (round, i, "hash_stage", hi))))
-
-                self._build_debug_compares(body, sB, group_items_B, round, "hashed_val")
-
-                # B: branch and wrap (sequential - no more A ops to interleave in round 0)
-                branch_valu_B = self._get_branch_valu_ops(sB, shared, num_vectors)
-                body.append(("bundle", {"valu": branch_valu_B}))
-
-                branch_flow_B = self._get_branch_flow_ops(sB, num_vectors)
-                for flow_op in branch_flow_B:
-                    body.append(("flow", flow_op))
-                self._build_debug_compares(body, sB, group_items_B, round, "next_idx")
-
-                wrap_valu_B = self._get_wrap_valu_ops(sB, shared, num_vectors)
-                body.append(("bundle", {"valu": wrap_valu_B}))
-
-                wrap_flow_B = self._get_wrap_flow_ops(sB, shared, num_vectors)
-                for flow_op in wrap_flow_B:
-                    body.append(("flow", flow_op))
-                self._build_debug_compares(body, sB, group_items_B, round, "wrapped_idx")
-            else:
-                # Rounds 1+: Pipeline A's compute with B's gather loads, then interleave A's flow with B's valu
-
-                if round == 1:
-                    # Round 1: need to load A normally (not prefetched)
-                    # Fuse address compute for both A and B
-                    valu_ops = []
-                    self._compute_gather_addr_ops(valu_ops, sA, shared, num_vectors)
-                    self._compute_gather_addr_ops(valu_ops, sB, shared, num_vectors)
-                    body.append(("bundle", {"valu": valu_ops}))
-
-                    # A: gather loads (not prefetched for round 1)
-                    load_cycles_A = self._build_gather_loads(sA, num_vectors)
-                    for load_ops in load_cycles_A:
-                        body.append(("bundle", {"load": load_ops}))
-                else:
-                    # Rounds 2+: A's loads were prefetched, only compute B's addresses
-                    self._build_gather_addr_compute(body, sB, shared, num_vectors)
-
-                # Generate B's gather loads
-                load_cycles_B = self._build_gather_loads(sB, num_vectors)
-
-                # A: XOR fused with first B load
-                valu_ops = [("^", sA['tmp_val'][v], sA['tmp_val'][v], sA['tmp_node_val'][v]) for v in range(num_vectors)]
-                body.append(("bundle", {"valu": valu_ops, "load": load_cycles_B[0]}))
-                self._build_debug_compares(body, sA, group_items_A, round, "node_val")
-
-                # A: hash stages with remaining B loads interleaved
-                remaining_B_loads = load_cycles_B[1:]
-                self._build_hash_stages_with_loads(body, sA, shared, num_vectors, group_items_A, round, remaining_B_loads)
-                self._build_debug_compares(body, sA, group_items_A, round, "hashed_val")
-
-                # === Interleave A's flow ops with B's valu ops ===
-                # A needs: branch valu, branch flow[0], branch flow[1], wrap valu, wrap flow[0], wrap flow[1]
-                # B needs: XOR valu, then hash valu ops (12 bundles for 6 stages x 2)
-                # Key insight: valu slot limit is 6, so we can fuse more ops together
-
-                branch_flow_A = self._get_branch_flow_ops(sA, num_vectors)
-                wrap_flow_A = self._get_wrap_flow_ops(sA, shared, num_vectors)
-
-                # A: branch valu (6 ops) + B: XOR valu (2 ops) = 8 ops - over limit, split
-                # Instead: A branch valu first, then B XOR with A branch flow[0]
-                branch_valu_A = self._get_branch_valu_ops(sA, shared, num_vectors)
-                xor_valu_B = [("^", sB['tmp_val'][v], sB['tmp_val'][v], sB['tmp_node_val'][v]) for v in range(num_vectors)]
-                # Fuse branch valu (6 ops) - fills the slot
-                body.append(("bundle", {"valu": branch_valu_A}))
-
-                # A: branch flow[0] + B: XOR valu (2 ops)
-                body.append(("bundle", {"flow": [branch_flow_A[0]], "valu": xor_valu_B}))
-                self._build_debug_compares(body, sB, group_items_B, round, "node_val")
-
-                # Build B's hash valu ops (we'll interleave with remaining A flow ops)
-                # Each hash stage has 2 valu bundles: (op1+op3), then (op2)
-                b_hash_valu_ops = []
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    # Part 1: tmp1 = val op1 val1, tmp2 = val op3 val3
-                    valu1 = []
-                    for v in range(num_vectors):
-                        valu1.append((op1, sB['tmp1'][v], sB['tmp_val'][v], shared['val1_vecs'][hi]))
-                        valu1.append((op3, sB['tmp2'][v], sB['tmp_val'][v], shared['val3_vecs'][hi]))
-                    b_hash_valu_ops.append(('valu1', hi, valu1))
-                    # Part 2: val = tmp1 op2 tmp2
-                    valu2 = []
-                    for v in range(num_vectors):
-                        valu2.append((op2, sB['tmp_val'][v], sB['tmp1'][v], sB['tmp2'][v]))
-                    b_hash_valu_ops.append(('valu2', hi, valu2))
-
-                b_hash_idx = 0
-
-                # A: branch flow[1] + B: hash stage 0 part 1
-                if b_hash_idx < len(b_hash_valu_ops):
-                    _, _, b_valu = b_hash_valu_ops[b_hash_idx]
-                    body.append(("bundle", {"flow": [branch_flow_A[1]], "valu": b_valu}))
-                    b_hash_idx += 1
-                else:
-                    body.append(("bundle", {"flow": [branch_flow_A[1]]}))
-                self._build_debug_compares(body, sA, group_items_A, round, "next_idx")
-
-                # A: wrap valu (MUST be after branch flow completes - reads new tmp_idx)
-                wrap_valu_A = self._get_wrap_valu_ops(sA, shared, num_vectors)
-                if b_hash_idx < len(b_hash_valu_ops):
-                    _, hi, b_valu = b_hash_valu_ops[b_hash_idx]
-                    body.append(("bundle", {"valu": wrap_valu_A + b_valu}))
-                    b_hash_idx += 1
-                    # Debug compare for B after hash stage completes (after part 2)
-                    if b_hash_valu_ops[b_hash_idx-1][0] == 'valu2':
-                        for j, i in enumerate(group_items_B):
-                            vv, vi = j // VLEN, j % VLEN
-                            body.append(("debug", ("compare", sB['tmp_val'][vv] + vi, (round, i, "hash_stage", hi))))
-                else:
-                    body.append(("bundle", {"valu": wrap_valu_A}))
-
-                # A: wrap flow[0] + B: continue hash
-                if b_hash_idx < len(b_hash_valu_ops):
-                    _, hi, b_valu = b_hash_valu_ops[b_hash_idx]
-                    body.append(("bundle", {"flow": [wrap_flow_A[0]], "valu": b_valu}))
-                    b_hash_idx += 1
-                    if b_hash_valu_ops[b_hash_idx-1][0] == 'valu2':
-                        for j, i in enumerate(group_items_B):
-                            vv, vi = j // VLEN, j % VLEN
-                            body.append(("debug", ("compare", sB['tmp_val'][vv] + vi, (round, i, "hash_stage", hi))))
-                else:
-                    body.append(("bundle", {"flow": [wrap_flow_A[0]]}))
-
-                # A: wrap flow[1] + B: continue hash
-                if b_hash_idx < len(b_hash_valu_ops):
-                    _, hi, b_valu = b_hash_valu_ops[b_hash_idx]
-                    body.append(("bundle", {"flow": [wrap_flow_A[1]], "valu": b_valu}))
-                    b_hash_idx += 1
-                    if b_hash_valu_ops[b_hash_idx-1][0] == 'valu2':
-                        for j, i in enumerate(group_items_B):
-                            vv, vi = j // VLEN, j % VLEN
-                            body.append(("debug", ("compare", sB['tmp_val'][vv] + vi, (round, i, "hash_stage", hi))))
-                else:
-                    body.append(("bundle", {"flow": [wrap_flow_A[1]]}))
-                self._build_debug_compares(body, sA, group_items_A, round, "wrapped_idx")
-
-                # Prefetch: compute A's gather addresses for next round (if not last round)
-                if round < rounds - 1:
-                    # Fuse prefetch addr compute with B's remaining hash valu
-                    prefetch_valu_A = []
-                    self._compute_gather_addr_ops(prefetch_valu_A, sA, shared, num_vectors)
-                    if b_hash_idx < len(b_hash_valu_ops):
-                        _, hi, b_valu = b_hash_valu_ops[b_hash_idx]
-                        body.append(("bundle", {"valu": prefetch_valu_A + b_valu}))
-                        b_hash_idx += 1
-                        if b_hash_valu_ops[b_hash_idx-1][0] == 'valu2':
-                            for j, i in enumerate(group_items_B):
-                                vv, vi = j // VLEN, j % VLEN
-                                body.append(("debug", ("compare", sB['tmp_val'][vv] + vi, (round, i, "hash_stage", hi))))
-                    else:
-                        body.append(("bundle", {"valu": prefetch_valu_A}))
-                    next_round_A_loads = self._build_gather_loads(sA, num_vectors)
-                else:
-                    next_round_A_loads = []
-
-                # Continue B's remaining hash stages with A's prefetch loads interleaved
-                load_idx = 0
-                while b_hash_idx < len(b_hash_valu_ops):
-                    _, hi, b_valu = b_hash_valu_ops[b_hash_idx]
-                    if load_idx < len(next_round_A_loads):
-                        body.append(("bundle", {"valu": b_valu, "load": next_round_A_loads[load_idx]}))
-                        load_idx += 1
-                    else:
-                        body.append(("bundle", {"valu": b_valu}))
-                    b_hash_idx += 1
-                    if b_hash_valu_ops[b_hash_idx-1][0] == 'valu2':
-                        for j, i in enumerate(group_items_B):
-                            vv, vi = j // VLEN, j % VLEN
-                            body.append(("debug", ("compare", sB['tmp_val'][vv] + vi, (round, i, "hash_stage", hi))))
-
-                self._build_debug_compares(body, sB, group_items_B, round, "hashed_val")
-
-                # Complete any remaining A prefetch loads
-                while load_idx < len(next_round_A_loads):
-                    body.append(("bundle", {"load": next_round_A_loads[load_idx]}))
-                    load_idx += 1
-
-                # B: branch valu (compute tmp1, idx_plus_1, idx_plus_2)
-                branch_valu_B = self._get_branch_valu_ops(sB, shared, num_vectors)
-                body.append(("bundle", {"valu": branch_valu_B}))
-
-                # B: branch flow ops (need to be executed before we can do wrap)
-                branch_flow_B = self._get_branch_flow_ops(sB, num_vectors)
-                for flow_op in branch_flow_B:
-                    body.append(("flow", flow_op))
-                self._build_debug_compares(body, sB, group_items_B, round, "next_idx")
-
-                # B: wrap valu
-                wrap_valu_B = self._get_wrap_valu_ops(sB, shared, num_vectors)
-                body.append(("bundle", {"valu": wrap_valu_B}))
-
-                # B: wrap flow ops
-                wrap_flow_B = self._get_wrap_flow_ops(sB, shared, num_vectors)
-                for flow_op in wrap_flow_B:
-                    body.append(("flow", flow_op))
-                self._build_debug_compares(body, sB, group_items_B, round, "wrapped_idx")
 
     def build_kernel(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
         """Build the complete kernel program for tree traversal."""
@@ -893,8 +529,16 @@ class KernelBuilder:
             self._emit_group_loads(body, sA, num_vectors)
             self._emit_group_loads(body, sB, num_vectors)
 
-            # Process both groups with pipelining
-            self._process_group_pair_pipelined(body, sA, sB, shared, group_items_A, group_items_B, num_vectors, rounds)
+            # Generate all instructions for both groups across all rounds
+            instrs_A = []
+            instrs_B = []
+            for round_num in range(rounds):
+                instrs_A.extend(self._gen_round_instrs(sA, shared, "A", round_num, num_vectors, group_items_A))
+                instrs_B.extend(self._gen_round_instrs(sB, shared, "B", round_num, num_vectors, group_items_B))
+
+            # Schedule instructions into bundles
+            scheduled = self._schedule_instructions(instrs_A, instrs_B)
+            body.extend(scheduled)
 
             # Store results for both groups
             body.append(("bundle", {"store": [("vstore", sA['vload_addr_idx'][v], sA['tmp_idx'][v]) for v in range(num_vectors)]}))
