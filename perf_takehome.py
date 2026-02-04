@@ -539,21 +539,6 @@ class KernelBuilder:
         body.append(("bundle", {"load": [("vload", s['tmp_val'][v], s['vload_addr_val'][v]) for v in range(num_vectors)]}))
 
 
-    def _load_group_data(self, body, s, group_start, num_vectors, batch_size):
-        """Compute addresses and load idx/val vectors for a single group.
-
-        Args:
-            body: List to append instructions to.
-            s: Scratch vectors dict for this group (sA or sB).
-            group_start: Starting index of the group in the batch.
-            num_vectors: Number of vectors per group.
-            batch_size: Total batch size (for bounds checking).
-        """
-        alu_ops = []
-        self._compute_load_addresses(alu_ops, s, group_start, num_vectors)
-        body.append(("bundle", {"alu": alu_ops}))
-        self._emit_group_loads(body, s, num_vectors)
-
     def _build_debug_compares(self, body, s, group_items, round, tag):
         """Build debug compare instructions for verification."""
         for j, i in enumerate(group_items):
@@ -566,27 +551,6 @@ class KernelBuilder:
                 body.append(("debug", ("compare", s['tmp_node_val'][v] + vi, (round, i, tag))))
             elif tag == "next_idx" or tag == "wrapped_idx":
                 body.append(("debug", ("compare", s['tmp_idx'][v] + vi, (round, i, tag))))
-
-    def _process_single_group(self, body, s, shared, group_items, num_vectors, rounds):
-        """Process a single group through all rounds (non-pipelined fallback)."""
-        for round in range(rounds):
-            self._build_debug_compares(body, s, group_items, round, "idx")
-            self._build_debug_compares(body, s, group_items, round, "val")
-
-            if round == 0:
-                self._build_gather_round0(body, s, shared, num_vectors)
-            else:
-                self._build_gather_node_values(body, s, shared, group_items, num_vectors)
-            self._build_debug_compares(body, s, group_items, round, "node_val")
-
-            self._build_hash_stages(body, s, shared, num_vectors, group_items, round)
-            self._build_debug_compares(body, s, group_items, round, "hashed_val")
-
-            self._build_branch_computation(body, s, shared, num_vectors)
-            self._build_debug_compares(body, s, group_items, round, "next_idx")
-
-            self._build_wrap_check(body, s, shared, num_vectors)
-            self._build_debug_compares(body, s, group_items, round, "wrapped_idx")
 
     def _process_group_round0(self, body, s, shared, group_items, num_vectors, round):
         """Process a single group through round 0 (broadcast optimization)."""
@@ -914,43 +878,29 @@ class KernelBuilder:
         num_groups = len(group_starts)
 
         for pair_idx in range(0, num_groups, 2):
-            group_idx_A = pair_idx
-            group_idx_B = pair_idx + 1 if pair_idx + 1 < num_groups else None
-
-            group_start_A = group_starts[group_idx_A]
+            group_start_A = group_starts[pair_idx]
+            group_start_B = group_starts[pair_idx + 1]
             group_items_A = list(range(group_start_A, min(group_start_A + bundle_size, batch_size)))
+            group_items_B = list(range(group_start_B, min(group_start_B + bundle_size, batch_size)))
 
-            if group_idx_B is not None:
-                # We have a pair - fuse ALU ops for both groups
-                group_start_B = group_starts[group_idx_B]
-                group_items_B = list(range(group_start_B, min(group_start_B + bundle_size, batch_size)))
+            # Compute addresses for both groups in one ALU bundle
+            alu_ops = []
+            self._compute_load_addresses(alu_ops, sA, group_start_A, num_vectors)
+            self._compute_load_addresses(alu_ops, sB, group_start_B, num_vectors)
+            body.append(("bundle", {"alu": alu_ops}))
 
-                # Compute addresses for both groups in one ALU bundle
-                alu_ops = []
-                self._compute_load_addresses(alu_ops, sA, group_start_A, num_vectors)
-                self._compute_load_addresses(alu_ops, sB, group_start_B, num_vectors)
-                body.append(("bundle", {"alu": alu_ops}))
+            # Load idx and val for both groups
+            self._emit_group_loads(body, sA, num_vectors)
+            self._emit_group_loads(body, sB, num_vectors)
 
-                # Load idx and val for both groups
-                self._emit_group_loads(body, sA, num_vectors)
-                self._emit_group_loads(body, sB, num_vectors)
+            # Process both groups with pipelining
+            self._process_group_pair_pipelined(body, sA, sB, shared, group_items_A, group_items_B, num_vectors, rounds)
 
-                # Process both groups with pipelining
-                self._process_group_pair_pipelined(body, sA, sB, shared, group_items_A, group_items_B, num_vectors, rounds)
-
-                # Store results for both groups
-                body.append(("bundle", {"store": [("vstore", sA['vload_addr_idx'][v], sA['tmp_idx'][v]) for v in range(num_vectors)]}))
-                body.append(("bundle", {"store": [("vstore", sA['vload_addr_val'][v], sA['tmp_val'][v]) for v in range(num_vectors)]}))
-                body.append(("bundle", {"store": [("vstore", sB['vload_addr_idx'][v], sB['tmp_idx'][v]) for v in range(num_vectors)]}))
-                body.append(("bundle", {"store": [("vstore", sB['vload_addr_val'][v], sB['tmp_val'][v]) for v in range(num_vectors)]}))
-            else:
-                # Odd group at the end - load and process single group
-                self._load_group_data(body, sA, group_start_A, num_vectors, batch_size)
-                self._process_single_group(body, sA, shared, group_items_A, num_vectors, rounds)
-
-                # Store results
-                body.append(("bundle", {"store": [("vstore", sA['vload_addr_idx'][v], sA['tmp_idx'][v]) for v in range(num_vectors)]}))
-                body.append(("bundle", {"store": [("vstore", sA['vload_addr_val'][v], sA['tmp_val'][v]) for v in range(num_vectors)]}))
+            # Store results for both groups
+            body.append(("bundle", {"store": [("vstore", sA['vload_addr_idx'][v], sA['tmp_idx'][v]) for v in range(num_vectors)]}))
+            body.append(("bundle", {"store": [("vstore", sA['vload_addr_val'][v], sA['tmp_val'][v]) for v in range(num_vectors)]}))
+            body.append(("bundle", {"store": [("vstore", sB['vload_addr_idx'][v], sB['tmp_idx'][v]) for v in range(num_vectors)]}))
+            body.append(("bundle", {"store": [("vstore", sB['vload_addr_val'][v], sB['tmp_val'][v]) for v in range(num_vectors)]}))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
