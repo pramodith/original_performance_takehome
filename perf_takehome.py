@@ -487,33 +487,38 @@ class KernelBuilder:
         bundle_size = SLOT_LIMITS["load"] * VLEN  # 16 elements per cycle
         num_vectors = SLOT_LIMITS["load"]  # 2 vectors
 
-        # Allocate three sets of working vectors for pipelining
-        sA = self._alloc_scratch_vectors_for_set(num_vectors, 'A')
-        sB = self._alloc_scratch_vectors_for_set(num_vectors, 'B')
-        sC = self._alloc_scratch_vectors_for_set(num_vectors, 'C')
+        # Allocate 8 sets of working vectors for pipelining
+        num_concurrent = 8
+        scratch_sets = [self._alloc_scratch_vectors_for_set(num_vectors, chr(ord('A') + i))
+                        for i in range(num_concurrent)]
         shared = self._alloc_shared_vectors(num_vectors)
 
         self._broadcast_constants(body, shared, zero_const, one_const, two_const)
 
-        # Process groups in triplets for pipelining
+        # Process groups in batches for pipelining
         group_starts = list(range(0, batch_size, bundle_size))
         num_groups = len(group_starts)
 
-        for triplet_idx in range(0, num_groups, 3):
-            # Determine which groups are in this triplet
+        for batch_idx in range(0, num_groups, num_concurrent):
+            # Determine which groups are in this batch
             active_groups = []
-            for offset, s in enumerate([sA, sB, sC]):
-                group_idx = triplet_idx + offset
+            for offset in range(num_concurrent):
+                group_idx = batch_idx + offset
                 if group_idx < num_groups:
+                    s = scratch_sets[offset]
                     group_start = group_starts[group_idx]
                     group_items = list(range(group_start, min(group_start + bundle_size, batch_size)))
                     active_groups.append((s, group_start, group_items, chr(ord('A') + offset)))
 
-            # Compute addresses for all active groups
+            # Compute addresses for all active groups (respecting ALU slot limit of 12)
             alu_ops = []
             for s, group_start, group_items, name in active_groups:
                 self._compute_load_addresses(alu_ops, s, group_start, num_vectors)
-            body.append(("bundle", {"alu": alu_ops}))
+                if len(alu_ops) >= SLOT_LIMITS["alu"]:
+                    body.append(("bundle", {"alu": alu_ops[:SLOT_LIMITS["alu"]]}))
+                    alu_ops = alu_ops[SLOT_LIMITS["alu"]:]
+            if alu_ops:
+                body.append(("bundle", {"alu": alu_ops}))
 
             # Load idx and val for all active groups
             for s, group_start, group_items, name in active_groups:
