@@ -376,10 +376,10 @@ class KernelBuilder:
         # This eliminates the vselect entirely!
         # Original: idx = vselect(val%2, 2*idx+2, 2*idx+1)
         # When val%2=1: 2*idx+2. When val%2=0: 2*idx+1
-        # So: 2*idx + 1 + (val%2)
+        # So: 2*idx + 1 + (val&1)  [val&1 is equivalent to val%2 for non-negative integers]
         for v in range(num_vectors):
-            # tmp1 = val % 2
-            instrs.append(Instruction("valu", ("%", s['tmp1'][v], s['tmp_val'][v], shared['two_vec']), group, 2, round_num, 0))
+            # tmp1 = val & 1 (same as val % 2)
+            instrs.append(Instruction("valu", ("&", s['tmp1'][v], s['tmp_val'][v], shared['one_vec']), group, 2, round_num, 0))
             # idx_plus_1 = 2*idx + 1
             instrs.append(Instruction("valu", ("multiply_add", s['idx_plus_1'][v], s['tmp_idx'][v], shared['two_vec'], shared['one_vec']), group, 2, round_num, 0))
 
@@ -395,16 +395,22 @@ class KernelBuilder:
         return instrs
 
     def _gen_wrap_instrs(self, s, shared, group, round_num, num_vectors, group_items):
-        """Generate wrap instructions for one group's round."""
+        """Generate wrap instructions for one group's round.
+
+        Wrap logic: idx = (idx < n_nodes) ? idx : 0
+        Optimized to avoid vselect (flow op, limit 1) using multiply:
+          idx = idx * (idx < n_nodes)
+        Compare returns 1 if true, 0 if false, so this zeros idx when >= n_nodes.
+        """
         instrs = []
 
-        # Valu ops: tmp3 = idx < n_nodes
+        # tmp3 = idx < n_nodes (returns 1 if true, 0 if false)
         for v in range(num_vectors):
             instrs.append(Instruction("valu", ("<", s['tmp3'][v], s['tmp_idx'][v], shared['n_nodes_vec']), group, 3, round_num, 0))
 
-        # Flow ops: vselect (must come after valu, all same seq since flow limit is 1 anyway)
+        # idx = idx * tmp3 (zeros idx if it was >= n_nodes)
         for v in range(num_vectors):
-            instrs.append(Instruction("flow", ("vselect", s['tmp_idx'][v], s['tmp3'][v], s['tmp_idx'][v], shared['zero_vec']), group, 3, round_num, 1))
+            instrs.append(Instruction("valu", ("*", s['tmp_idx'][v], s['tmp_idx'][v], s['tmp3'][v]), group, 3, round_num, 1))
 
         # Debug compares
         for j, i in enumerate(group_items):
