@@ -622,67 +622,66 @@ class KernelBuilder:
         return None
 
     def _try_merge_bundles(self, bundle1, bundle2):
-        """Try to merge two bundles if slot limits allow.
+        """Try to merge instructions from bundle2 into bundle1.
 
-        Returns merged bundle if successful, None if slots would overflow.
+        Returns (merged_bundle, remaining_bundle) where:
+        - merged_bundle has as many ops from bundle2 as fit
+        - remaining_bundle has ops that didn't fit (or None if all fit)
         """
         _, ops1 = bundle1
         _, ops2 = bundle2
 
-        # Check if merging would exceed any slot limit
-        for engine in set(ops1.keys()) | set(ops2.keys()):
-            combined = len(ops1.get(engine, [])) + len(ops2.get(engine, []))
-            if combined > SLOT_LIMITS.get(engine, 1):
-                return None
-
-        # Merge is possible
         merged = {engine: list(ops) for engine, ops in ops1.items()}
+        remaining = {}
+
         for engine, ops in ops2.items():
-            if engine in merged:
-                merged[engine].extend(ops)
+            limit = SLOT_LIMITS.get(engine, 1)
+            current = len(merged.get(engine, []))
+            available = limit - current
+
+            if available >= len(ops):
+                # All ops fit
+                if engine in merged:
+                    merged[engine].extend(ops)
+                else:
+                    merged[engine] = list(ops)
+            elif available > 0:
+                # Partial fit - take what we can
+                if engine in merged:
+                    merged[engine].extend(ops[:available])
+                else:
+                    merged[engine] = list(ops[:available])
+                remaining[engine] = ops[available:]
             else:
-                merged[engine] = list(ops)
-        return ("bundle", merged)
+                # Nothing fits
+                remaining[engine] = list(ops)
+
+        merged_bundle = ("bundle", {k: v for k, v in merged.items() if v})
+        remaining_bundle = ("bundle", remaining) if remaining else None
+        return merged_bundle, remaining_bundle
 
     def _merge_bundle_lists(self, body, scheduled):
-        """Merge bundles from scheduled into body where possible.
+        """Merge first bundle of scheduled into last bundle of body if possible.
 
-        Tries to merge bundles from the head of scheduled with bundles at the
-        end of body, preserving order. Once a scheduled bundle can't merge,
-        all subsequent scheduled bundles go to remaining.
-
-        Key constraint: if scheduled[j] merges into body[i], then scheduled[j+1]
-        must either merge into body[i'] where i' >= i, or come after all of body.
+        Only merges the first scheduled bundle (partially or fully) into body[-1].
+        Rest of scheduled bundles are returned as-is to preserve ordering.
 
         Modifies body in place and returns remaining scheduled bundles.
         """
         if not body or not scheduled:
             return scheduled
 
-        remaining = []
-        min_body_idx = len(body) - 1  # Can only merge at or after this index
+        # Only try to merge the first scheduled bundle into body[-1]
+        merged, remaining = self._try_merge_bundles(body[-1], scheduled[0])
+        body[-1] = merged
 
-        for sched_bundle in scheduled:
-            if remaining:
-                # Once we have remaining bundles, all subsequent must also be remaining
-                # to preserve order
-                remaining.append(sched_bundle)
-                continue
+        # Build result: remaining from first bundle (if any) + rest of scheduled
+        result = []
+        if remaining:
+            result.append(remaining)
+        result.extend(scheduled[1:])
 
-            merged = False
-            # Try to merge at min_body_idx first, then at later indices
-            for i in range(min_body_idx, len(body)):
-                result = self._try_merge_bundles(body[i], sched_bundle)
-                if result:
-                    body[i] = result
-                    merged = True
-                    min_body_idx = i  # Next must merge at same index or later
-                    break
-
-            if not merged:
-                remaining.append(sched_bundle)
-
-        return remaining
+        return result
 
     def _schedule_group(self, instrs, idx, bundle):
         """Schedule instructions from one group into a bundle. Returns (new_idx, scheduled_any).
@@ -884,11 +883,13 @@ class KernelBuilder:
         body = []
 
         # Setup: allocate vectors and broadcast constants
-        bundle_size = SLOT_LIMITS["load"] * VLEN  # 16 elements per cycle
-        num_vectors = SLOT_LIMITS["load"]  # 2 vectors
+        # Try 1 vector per group with more concurrent groups
+        num_vectors = 1  # 1 vector = 8 elements per group
+        bundle_size = num_vectors * VLEN  # 8 elements per group
 
         # Allocate N sets of working vectors for pipelining
-        num_concurrent = 9
+        # With fewer vectors per group, we can fit more concurrent groups
+        num_concurrent = 16
         scratch_sets = [self._alloc_scratch_vectors_for_set(num_vectors, chr(ord('A') + i))
                         for i in range(num_concurrent)]
         shared = self._alloc_shared_vectors(num_vectors)
@@ -925,8 +926,7 @@ class KernelBuilder:
 
             # Schedule instructions into bundles
             scheduled = self._schedule_instructions(*instr_lists)
-
-            # Try to merge bundles from scheduled into body
+            # Try to merge ops from scheduled into body's last bundle
             scheduled = self._merge_bundle_lists(body, scheduled)
             body.extend(scheduled)
 
