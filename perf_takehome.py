@@ -372,7 +372,11 @@ class KernelBuilder:
         # When val%2=1: 2*idx+2. When val%2=0: 2*idx+1
         # So: 2*idx + 1 + (val&1)  [val&1 is equivalent to val%2 for non-negative integers]
         for v in range(num_vectors):
+<<<<<<< HEAD
             # tmp1 = val & 1 (same as val % 2)
+=======
+            # tmp1 = val & 1 (same as val % 2, but bitwise AND is cheaper)
+>>>>>>> 5324d2cfd7580560f84f8e367a064367fab5b1c3
             instrs.append(Instruction("valu", ("&", s['tmp1'][v], s['tmp_val'][v], shared['one_vec']), group, 2, round_num, 0))
             # idx_plus_1 = 2*idx + 1
             instrs.append(Instruction("valu", ("multiply_add", s['idx_plus_1'][v], s['tmp_idx'][v], shared['two_vec'], shared['one_vec']), group, 2, round_num, 0))
