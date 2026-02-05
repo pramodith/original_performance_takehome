@@ -265,19 +265,33 @@ class KernelBuilder:
         s['n_nodes_vec'] = self.alloc_scratch("n_nodes_vec", VLEN)
         s['forest_values_p_vec'] = self.alloc_scratch("forest_values_p_vec", VLEN)
 
+        # Level-based tree value preloading for rounds 1-3
+        s['level1_scalars'] = [self.alloc_scratch(f"tree_l1_{i}") for i in range(2)]
+        s['level2_scalars'] = [self.alloc_scratch(f"tree_l2_{i}") for i in range(4)]
+        s['level3_scalars'] = [self.alloc_scratch(f"tree_l3_{i}") for i in range(8)]
+        s['level1_vecs'] = [self.alloc_scratch(f"tree_l1_vec_{i}", VLEN) for i in range(2)]
+        s['level2_vecs'] = [self.alloc_scratch(f"tree_l2_vec_{i}", VLEN) for i in range(4)]
+        s['level3_vecs'] = [self.alloc_scratch(f"tree_l3_vec_{i}", VLEN) for i in range(8)]
+        s['three_vec'] = self.alloc_scratch("three_vec", VLEN)
+        s['seven_vec'] = self.alloc_scratch("seven_vec", VLEN)
+
         return s
 
     def _broadcast_constants(self, body, shared, zero_const, one_const, two_const):
         """Broadcast all constant vectors once before the main loop."""
         # Basic constants
+        three_const = self.scratch_const(3)
+        seven_const = self.scratch_const(7)
         body.append(("bundle", {"valu": [
             ("vbroadcast", shared['two_vec'], two_const),
             ("vbroadcast", shared['one_vec'], one_const),
             ("vbroadcast", shared['n_nodes_vec'], self.scratch["n_nodes"]),
             ("vbroadcast", shared['forest_values_p_vec'], self.scratch["forest_values_p"]),
+            ("vbroadcast", shared['three_vec'], three_const),
+            ("vbroadcast", shared['seven_vec'], seven_const),
         ]}))
 
-        # Hash stage constants - broadcast val1 for all, val3/multiplier depending on optimization
+        # Hash stage constants
         valu_ops = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             valu_ops.append(("vbroadcast", shared['val1_vecs'][hi], self.scratch_const(val1)))
@@ -286,8 +300,33 @@ class KernelBuilder:
             if hi in shared['hash_mul_vecs']:
                 multiplier = (1 << val3) + 1
                 valu_ops.append(("vbroadcast", shared['hash_mul_vecs'][hi], self.scratch_const(multiplier)))
-            # Emit bundle when full (limit 6)
             if len(valu_ops) >= 5:
+                body.append(("bundle", {"valu": valu_ops}))
+                valu_ops = []
+        if valu_ops:
+            body.append(("bundle", {"valu": valu_ops}))
+
+        # Preload tree values for levels 1-3
+        tmp_addr = [self.alloc_scratch(f"tmp_tree_addr_{i}") for i in range(2)]
+        all_indices = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        all_scalars = shared['level1_scalars'] + shared['level2_scalars'] + shared['level3_scalars']
+        for i in range(0, len(all_indices), 2):
+            alu_ops = [("+", tmp_addr[j], self.scratch["forest_values_p"], self.scratch_const(all_indices[i+j])) for j in range(min(2, len(all_indices)-i))]
+            body.append(("bundle", {"alu": alu_ops}))
+            load_ops = [("load", all_scalars[i+j], tmp_addr[j]) for j in range(min(2, len(all_indices)-i))]
+            body.append(("bundle", {"load": load_ops}))
+
+        # Broadcast preloaded values to vectors
+        valu_ops = []
+        for i in range(2):
+            valu_ops.append(("vbroadcast", shared['level1_vecs'][i], shared['level1_scalars'][i]))
+        for i in range(4):
+            valu_ops.append(("vbroadcast", shared['level2_vecs'][i], shared['level2_scalars'][i]))
+        body.append(("bundle", {"valu": valu_ops}))
+        valu_ops = []
+        for i in range(8):
+            valu_ops.append(("vbroadcast", shared['level3_vecs'][i], shared['level3_scalars'][i]))
+            if len(valu_ops) >= 6:
                 body.append(("bundle", {"valu": valu_ops}))
                 valu_ops = []
         if valu_ops:
@@ -306,12 +345,137 @@ class KernelBuilder:
             for v in range(num_vectors):
                 instrs.append(Instruction("valu", ("vbroadcast", s['tmp_node_val'][v], s['tmp_addr'][0]), group, 0, round_num, seq))
             seq += 1
+        elif round_num == 1:
+            # Round 1: idx is 1 or 2, use 2-way select
+            # node_val = t0 + (t1-t0)*(idx-1)
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("-", s['tmp_addr'][v], s['tmp_idx'][v], shared['one_vec']), group, 0, round_num, seq))
+                instrs.append(Instruction("valu", ("-", s['tmp1'][v], shared['level1_vecs'][1], shared['level1_vecs'][0]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("*", s['tmp2'][v], s['tmp1'][v], s['tmp_addr'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("+", s['tmp_node_val'][v], shared['level1_vecs'][0], s['tmp2'][v]), group, 0, round_num, seq))
+            seq += 1
+        elif round_num == 2:
+            # Round 2: idx is 3-6, use 4-way select
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("-", s['tmp_addr'][v], s['tmp_idx'][v], shared['three_vec']), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("&", s['tmp1'][v], s['tmp_addr'][v], shared['one_vec']), group, 0, round_num, seq))
+                instrs.append(Instruction("valu", (">>", s['tmp2'][v], s['tmp_addr'][v], shared['one_vec']), group, 0, round_num, seq))
+                instrs.append(Instruction("valu", ("-", s['tmp3'][v], shared['level2_vecs'][1], shared['level2_vecs'][0]), group, 0, round_num, seq))
+                instrs.append(Instruction("valu", ("-", s['idx_plus_1'][v], shared['level2_vecs'][3], shared['level2_vecs'][2]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("*", s['tmp_addr'][v], s['tmp3'][v], s['tmp1'][v]), group, 0, round_num, seq))
+                instrs.append(Instruction("valu", ("*", s['tmp3'][v], s['idx_plus_1'][v], s['tmp1'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("+", s['idx_plus_1'][v], shared['level2_vecs'][0], s['tmp_addr'][v]), group, 0, round_num, seq))
+                instrs.append(Instruction("valu", ("+", s['tmp_addr'][v], shared['level2_vecs'][2], s['tmp3'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("-", s['tmp3'][v], s['tmp_addr'][v], s['idx_plus_1'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("*", s['tmp_addr'][v], s['tmp3'][v], s['tmp2'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("+", s['tmp_node_val'][v], s['idx_plus_1'][v], s['tmp_addr'][v]), group, 0, round_num, seq))
+            seq += 1
+        elif round_num == 3:
+            # Round 3: idx is 7-14, use 8-way select
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("-", s['tmp_addr'][v], s['tmp_idx'][v], shared['seven_vec']), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("&", s['tmp1'][v], s['tmp_addr'][v], shared['one_vec']), group, 0, round_num, seq))
+                instrs.append(Instruction("valu", (">>", s['tmp3'][v], s['tmp_addr'][v], shared['two_vec']), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", (">>", s['tmp2'][v], s['tmp_addr'][v], shared['one_vec']), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("&", s['tmp2'][v], s['tmp2'][v], shared['one_vec']), group, 0, round_num, seq))
+            seq += 1
+            # sel01 = t0 + (t1-t0)*bit0
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("-", s['tmp_addr'][v], shared['level3_vecs'][1], shared['level3_vecs'][0]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("*", s['tmp_addr'][v], s['tmp_addr'][v], s['tmp1'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("+", s['idx_plus_1'][v], shared['level3_vecs'][0], s['tmp_addr'][v]), group, 0, round_num, seq))
+            seq += 1
+            # sel23 = t2 + (t3-t2)*bit0
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("-", s['tmp_addr'][v], shared['level3_vecs'][3], shared['level3_vecs'][2]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("*", s['tmp_addr'][v], s['tmp_addr'][v], s['tmp1'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("+", s['tmp_node_val'][v], shared['level3_vecs'][2], s['tmp_addr'][v]), group, 0, round_num, seq))
+            seq += 1
+            # sel0123 = sel01 + (sel23-sel01)*bit1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("-", s['tmp_addr'][v], s['tmp_node_val'][v], s['idx_plus_1'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("*", s['tmp_addr'][v], s['tmp_addr'][v], s['tmp2'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("+", s['idx_plus_1'][v], s['idx_plus_1'][v], s['tmp_addr'][v]), group, 0, round_num, seq))
+            seq += 1
+            # sel45 = t4 + (t5-t4)*bit0
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("-", s['tmp_addr'][v], shared['level3_vecs'][5], shared['level3_vecs'][4]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("*", s['tmp_addr'][v], s['tmp_addr'][v], s['tmp1'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("+", s['tmp_node_val'][v], shared['level3_vecs'][4], s['tmp_addr'][v]), group, 0, round_num, seq))
+            seq += 1
+            # sel67 = t6 + (t7-t6)*bit0
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("-", s['tmp_addr'][v], shared['level3_vecs'][7], shared['level3_vecs'][6]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("*", s['tmp_addr'][v], s['tmp_addr'][v], s['tmp1'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("+", s['tmp1'][v], shared['level3_vecs'][6], s['tmp_addr'][v]), group, 0, round_num, seq))
+            seq += 1
+            # sel4567 = sel45 + (sel67-sel45)*bit1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("-", s['tmp_addr'][v], s['tmp1'][v], s['tmp_node_val'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("*", s['tmp_addr'][v], s['tmp_addr'][v], s['tmp2'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("+", s['tmp_node_val'][v], s['tmp_node_val'][v], s['tmp_addr'][v]), group, 0, round_num, seq))
+            seq += 1
+            # final = sel0123 + (sel4567-sel0123)*bit2
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("-", s['tmp_addr'][v], s['tmp_node_val'][v], s['idx_plus_1'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("*", s['tmp_addr'][v], s['tmp_addr'][v], s['tmp3'][v]), group, 0, round_num, seq))
+            seq += 1
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("+", s['tmp_node_val'][v], s['idx_plus_1'][v], s['tmp_addr'][v]), group, 0, round_num, seq))
+            seq += 1
         else:
-            # Rounds 1+: compute addresses and load individually
+            # Rounds 4+: scatter-gather
             for v in range(num_vectors):
                 instrs.append(Instruction("valu", ("+", s['tmp_addr'][v], s['tmp_idx'][v], shared['forest_values_p_vec']), group, 0, round_num, seq))
             seq += 1
-            # Individual loads (grouped by slot limit)
             for li in range(num_vectors * VLEN):
                 v, vi = li // VLEN, li % VLEN
                 instrs.append(Instruction("load", ("load", s['tmp_node_val'][v] + vi, s['tmp_addr'][v] + vi), group, 0, round_num, seq + li // SLOT_LIMITS["load"]))
