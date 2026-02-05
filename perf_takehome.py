@@ -824,7 +824,7 @@ class KernelBuilder:
 
         # Allocate N sets of working vectors for pipelining
         # With fewer vectors per group, we can fit more concurrent groups
-        num_concurrent = 16
+        num_concurrent = 18
         scratch_sets = [self._alloc_scratch_vectors_for_set(num_vectors, chr(ord('A') + i))
                         for i in range(num_concurrent)]
         shared = self._alloc_shared_vectors(num_vectors)
