@@ -621,18 +621,78 @@ class KernelBuilder:
             return [(opcode, dest + i, src1 + i, src2 + i) for i in range(offset, offset + count)]
         return None
 
-    def _schedule_group(self, instrs, idx, bundle, allow_phase_advance=True):
+    def _try_merge_bundles(self, bundle1, bundle2):
+        """Try to merge two bundles if slot limits allow.
+
+        Returns merged bundle if successful, None if slots would overflow.
+        """
+        _, ops1 = bundle1
+        _, ops2 = bundle2
+
+        # Check if merging would exceed any slot limit
+        for engine in set(ops1.keys()) | set(ops2.keys()):
+            combined = len(ops1.get(engine, [])) + len(ops2.get(engine, []))
+            if combined > SLOT_LIMITS.get(engine, 1):
+                return None
+
+        # Merge is possible
+        merged = {engine: list(ops) for engine, ops in ops1.items()}
+        for engine, ops in ops2.items():
+            if engine in merged:
+                merged[engine].extend(ops)
+            else:
+                merged[engine] = list(ops)
+        return ("bundle", merged)
+
+    def _merge_bundle_lists(self, body, scheduled):
+        """Merge bundles from scheduled into body where possible.
+
+        Tries to merge bundles from the head of scheduled with bundles at the
+        end of body, preserving order. Once a scheduled bundle can't merge,
+        all subsequent scheduled bundles go to remaining.
+
+        Key constraint: if scheduled[j] merges into body[i], then scheduled[j+1]
+        must either merge into body[i'] where i' >= i, or come after all of body.
+
+        Modifies body in place and returns remaining scheduled bundles.
+        """
+        if not body or not scheduled:
+            return scheduled
+
+        remaining = []
+        min_body_idx = len(body) - 1  # Can only merge at or after this index
+
+        for sched_bundle in scheduled:
+            if remaining:
+                # Once we have remaining bundles, all subsequent must also be remaining
+                # to preserve order
+                remaining.append(sched_bundle)
+                continue
+
+            merged = False
+            # Try to merge at min_body_idx first, then at later indices
+            for i in range(min_body_idx, len(body)):
+                result = self._try_merge_bundles(body[i], sched_bundle)
+                if result:
+                    body[i] = result
+                    merged = True
+                    min_body_idx = i  # Next must merge at same index or later
+                    break
+
+            if not merged:
+                remaining.append(sched_bundle)
+
+        return remaining
+
+    def _schedule_group(self, instrs, idx, bundle):
         """Schedule instructions from one group into a bundle. Returns (new_idx, scheduled_any).
 
         Args:
             instrs: Sorted list of instructions for this group
             idx: Current index into instrs
             bundle: Current bundle being built
-            allow_phase_advance: If True, group can advance phases independently.
-                                 If False, all groups must stay at same (round, phase, seq).
 
         Within a single group, seq boundaries are ALWAYS respected (data dependencies).
-        allow_phase_advance only controls whether different groups can be at different phases.
         """
         scheduled = False
         if idx >= len(instrs):
@@ -684,13 +744,11 @@ class KernelBuilder:
                 break  # Slot full for this engine
         return idx, scheduled
 
-    def _schedule_instructions(self, *instr_lists, allow_phase_advance=True, debug_phases=False):
+    def _schedule_instructions(self, *instr_lists, debug_phases=False):
         """Schedule instructions from multiple groups into bundles respecting slot limits and dependencies.
 
         Args:
             instr_lists: Variable number of instruction lists (one per group)
-            allow_phase_advance: If True, groups can be at different phases.
-                                 If False, all groups stay in lock-step.
             debug_phases: If True, print group positions to show phase divergence.
         """
         bundles = []
@@ -717,8 +775,23 @@ class KernelBuilder:
                         positions.append(f"G{i}:done")
                 print(f"Bundle {bundle_num}: {' | '.join(positions)}")
 
-            for i, instrs in enumerate(instr_lists):
-                indices[i], scheduled = self._schedule_group(instrs, indices[i], bundle, allow_phase_advance)
+            # Sort groups to prioritize those with load instructions pending
+            def group_priority(i):
+                if indices[i] >= len(instr_lists[i]):
+                    return (2, 0)  # Done groups last
+                instr = instr_lists[i][indices[i]]
+                if instr.engine == "load":
+                    return (0, instr.round)  # Load groups first, earlier rounds first
+                elif instr.engine == "store":
+                    return (0, instr.round)  # Store groups also high priority
+                else:
+                    return (1, instr.round)  # Compute groups second
+
+            order = sorted(range(len(instr_lists)), key=group_priority)
+
+            for i in order:
+                instrs = instr_lists[i]
+                indices[i], scheduled = self._schedule_group(instrs, indices[i], bundle)
                 any_scheduled = any_scheduled or scheduled
 
             out_bundle = {k: v for k, v in bundle.items() if v}
@@ -852,6 +925,9 @@ class KernelBuilder:
 
             # Schedule instructions into bundles
             scheduled = self._schedule_instructions(*instr_lists)
+
+            # Try to merge bundles from scheduled into body
+            scheduled = self._merge_bundle_lists(body, scheduled)
             body.extend(scheduled)
 
         body_instrs = self.build(body)
