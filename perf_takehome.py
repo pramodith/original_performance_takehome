@@ -339,13 +339,16 @@ class KernelBuilder:
         instrs = []
         seq = 0
 
-        if round_num == 0:
+        # Compute level within traversal cycle (wraps after forest_height + 1 rounds)
+        level = round_num % (self.forest_height + 1)
+
+        if level == 0:
             # Round 0: load root and broadcast
             instrs.append(Instruction("load", ("load", s['tmp_addr'][0], self.scratch["forest_values_p"]), group, 0, round_num, seq)); seq += 1
             for v in range(num_vectors):
                 instrs.append(Instruction("valu", ("vbroadcast", s['tmp_node_val'][v], s['tmp_addr'][0]), group, 0, round_num, seq))
             seq += 1
-        elif round_num == 1:
+        elif level == 1:
             # Round 1: idx is 1 or 2, use 2-way select
             # node_val = t0 + (t1-t0)*(idx-1)
             for v in range(num_vectors):
@@ -358,7 +361,7 @@ class KernelBuilder:
             for v in range(num_vectors):
                 instrs.append(Instruction("valu", ("+", s['tmp_node_val'][v], shared['level1_vecs'][0], s['tmp2'][v]), group, 0, round_num, seq))
             seq += 1
-        elif round_num == 2:
+        elif level == 2:
             # Round 2: idx is 3-6, use 4-way select
             for v in range(num_vectors):
                 instrs.append(Instruction("valu", ("-", s['tmp_addr'][v], s['tmp_idx'][v], shared['three_vec']), group, 0, round_num, seq))
@@ -386,7 +389,7 @@ class KernelBuilder:
             for v in range(num_vectors):
                 instrs.append(Instruction("valu", ("+", s['tmp_node_val'][v], s['idx_plus_1'][v], s['tmp_addr'][v]), group, 0, round_num, seq))
             seq += 1
-        elif round_num == 3:
+        elif level == 3:
             # Round 3: idx is 7-14, use 8-way select
             for v in range(num_vectors):
                 instrs.append(Instruction("valu", ("-", s['tmp_addr'][v], s['tmp_idx'][v], shared['seven_vec']), group, 0, round_num, seq))
@@ -868,6 +871,9 @@ class KernelBuilder:
 
     def build_kernel(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
         """Build the complete kernel program for tree traversal."""
+        # Store forest_height for use in gather instructions
+        self.forest_height = forest_height
+
         # Initialize memory variables
         self._init_memory_vars()
 
