@@ -245,21 +245,22 @@ class KernelBuilder:
         s = {}
 
         # Hash stage constant vectors
+        # val1_vecs needed for all stages
         s['val1_vecs'] = [self.alloc_scratch(f"val1_vec_{hi}", VLEN) for hi in range(len(HASH_STAGES))]
-        s['val3_vecs'] = [self.alloc_scratch(f"val3_vec_{hi}", VLEN) for hi in range(len(HASH_STAGES))]
-
-        # Multiplier vectors for optimized hash stages (where op1='+' and op2='+')
-        # Stage 0: multiplier = (1 << 12) + 1 = 4097
-        # Stage 2: multiplier = (1 << 5) + 1 = 33
-        # Stage 4: multiplier = (1 << 3) + 1 = 9
+        # val3_vecs only needed for non-optimized stages (where op1!='+' or op2!='+')
+        # hash_mul_vecs only needed for optimized stages (where op1='+' and op2='+')
+        s['val3_vecs'] = {}
         s['hash_mul_vecs'] = {}
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             if op1 == '+' and op2 == '+':
+                # Optimized stage - needs multiplier, not val3
                 s['hash_mul_vecs'][hi] = self.alloc_scratch(f"hash_mul_vec_{hi}", VLEN)
+            else:
+                # Non-optimized stage - needs val3, not multiplier
+                s['val3_vecs'][hi] = self.alloc_scratch(f"val3_vec_{hi}", VLEN)
 
         # Constant vectors for branch computation
         s['two_vec'] = self.alloc_scratch("two_vec", VLEN)
-        s['zero_vec'] = self.alloc_scratch("zero_vec", VLEN)
         s['one_vec'] = self.alloc_scratch("one_vec", VLEN)
         s['n_nodes_vec'] = self.alloc_scratch("n_nodes_vec", VLEN)
         s['forest_values_p_vec'] = self.alloc_scratch("forest_values_p_vec", VLEN)
@@ -271,31 +272,24 @@ class KernelBuilder:
         # Basic constants
         body.append(("bundle", {"valu": [
             ("vbroadcast", shared['two_vec'], two_const),
-            ("vbroadcast", shared['zero_vec'], zero_const),
             ("vbroadcast", shared['one_vec'], one_const),
             ("vbroadcast", shared['n_nodes_vec'], self.scratch["n_nodes"]),
             ("vbroadcast", shared['forest_values_p_vec'], self.scratch["forest_values_p"]),
         ]}))
 
-        # Hash stage constants (split into bundles, valu limit is 6)
-        valu_ops = []
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES[:3]):
-            valu_ops.append(("vbroadcast", shared['val1_vecs'][hi], self.scratch_const(val1)))
-            valu_ops.append(("vbroadcast", shared['val3_vecs'][hi], self.scratch_const(val3)))
-        body.append(("bundle", {"valu": valu_ops}))
-
-        valu_ops = []
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES[3:], start=3):
-            valu_ops.append(("vbroadcast", shared['val1_vecs'][hi], self.scratch_const(val1)))
-            valu_ops.append(("vbroadcast", shared['val3_vecs'][hi], self.scratch_const(val3)))
-        body.append(("bundle", {"valu": valu_ops}))
-
-        # Broadcast multipliers for optimized hash stages (stages 0, 2, 4)
+        # Hash stage constants - broadcast val1 for all, val3/multiplier depending on optimization
         valu_ops = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            if op1 == '+' and op2 == '+':
+            valu_ops.append(("vbroadcast", shared['val1_vecs'][hi], self.scratch_const(val1)))
+            if hi in shared['val3_vecs']:
+                valu_ops.append(("vbroadcast", shared['val3_vecs'][hi], self.scratch_const(val3)))
+            if hi in shared['hash_mul_vecs']:
                 multiplier = (1 << val3) + 1
                 valu_ops.append(("vbroadcast", shared['hash_mul_vecs'][hi], self.scratch_const(multiplier)))
+            # Emit bundle when full (limit 6)
+            if len(valu_ops) >= 5:
+                body.append(("bundle", {"valu": valu_ops}))
+                valu_ops = []
         if valu_ops:
             body.append(("bundle", {"valu": valu_ops}))
 
@@ -610,6 +604,21 @@ class KernelBuilder:
 
         return instrs
 
+    def _gen_final_store_instrs(self, s, group, num_vectors, final_round):
+        """Generate final store instructions for a group.
+
+        Uses round=final_round (after all compute rounds) so scheduler can
+        interleave stores with computation from groups still working.
+        """
+        instrs = []
+
+        # Store idx and val vectors back to memory
+        for v in range(num_vectors):
+            instrs.append(Instruction("store", ("vstore", s['vload_addr_idx'][v], s['tmp_idx'][v]), group, 0, final_round, 0))
+            instrs.append(Instruction("store", ("vstore", s['vload_addr_val'][v], s['tmp_val'][v]), group, 0, final_round, 0))
+
+        return instrs
+
     def _emit_group_loads(self, body, s, num_vectors):
         """Emit load bundles for idx and val vectors.
 
@@ -664,7 +673,7 @@ class KernelBuilder:
                     group_items = list(range(group_start, min(group_start + bundle_size, batch_size)))
                     active_groups.append((s, group_start, group_items, chr(ord('A') + offset)))
 
-            # Generate instructions for all active groups including initial loads
+            # Generate instructions for all active groups including initial loads and final stores
             instr_lists = []
             for s, group_start, group_items, name in active_groups:
                 instrs = []
@@ -673,16 +682,13 @@ class KernelBuilder:
                 # Add round instructions
                 for round_num in range(rounds):
                     instrs.extend(self._gen_round_instrs(s, shared, name, round_num, num_vectors, group_items))
+                # Add final store instructions (round = rounds, after all compute)
+                instrs.extend(self._gen_final_store_instrs(s, name, num_vectors, rounds))
                 instr_lists.append(instrs)
 
             # Schedule instructions into bundles
             scheduled = self._schedule_instructions(*instr_lists)
             body.extend(scheduled)
-
-            # Store results for all active groups
-            for s, group_start, group_items, name in active_groups:
-                body.append(("bundle", {"store": [("vstore", s['vload_addr_idx'][v], s['tmp_idx'][v]) for v in range(num_vectors)]}))
-                body.append(("bundle", {"store": [("vstore", s['vload_addr_val'][v], s['tmp_val'][v]) for v in range(num_vectors)]}))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
