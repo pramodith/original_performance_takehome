@@ -48,6 +48,7 @@ class Instruction:
     round: int            # Which round this instruction belongs to
     seq: int = 0          # Sequence number within phase for ordering
     scheduled: bool = field(default=False, repr=False)
+    scalar_offset: int = field(default=0, repr=False)  # For partial valu scalarization
 
 
 class KernelBuilder:
@@ -232,7 +233,6 @@ class KernelBuilder:
         s['tmp2'] = [self.alloc_scratch(f"tmp2{sfx}_{j}", VLEN) for j in range(num_vectors)]
         s['tmp3'] = [self.alloc_scratch(f"tmp3{sfx}_{j}", VLEN) for j in range(num_vectors)]  # For wrap (separate from branch's tmp1)
         s['idx_plus_1'] = [self.alloc_scratch(f"idx_plus_1{sfx}_{j}", VLEN) for j in range(num_vectors)]
-        s['idx_plus_2'] = [self.alloc_scratch(f"idx_plus_2{sfx}_{j}", VLEN) for j in range(num_vectors)]
 
         # Scalar addresses for vload/vstore
         s['vload_addr_idx'] = [self.alloc_scratch(f"vload_addr_idx{sfx}_{j}") for j in range(num_vectors)]
@@ -263,6 +263,9 @@ class KernelBuilder:
         s['one_vec'] = self.alloc_scratch("one_vec", VLEN)
         s['n_nodes_vec'] = self.alloc_scratch("n_nodes_vec", VLEN)
         s['forest_values_p_vec'] = self.alloc_scratch("forest_values_p_vec", VLEN)
+
+        # Temp storage for multiply_add scalarization
+        self._muladd_temp = self.alloc_scratch("muladd_temp", VLEN)
 
         return s
 
@@ -431,26 +434,30 @@ class KernelBuilder:
     # Operations that can be scalarized (valu -> alu)
     SCALARIZABLE_OPS = {"+", "-", "^", "%", "*", "&", "|", "<", ">", "<=", ">=", "==", "!="}
 
-    def _scalarize_valu_op(self, op):
-        """Convert a valu operation to 8 scalar alu operations.
+    def _scalarize_valu_op(self, op, offset=0, count=VLEN):
+        """Convert a valu operation to scalar alu operations.
 
         Args:
             op: A valu operation tuple like ("+", dest_vec, src1_vec, src2_vec)
+            offset: Starting element index (for partial scalarization)
+                    For multiply_add: 0-7 = multiply phase, 8-15 = add phase
+            count: Number of elements to scalarize
 
         Returns:
-            List of 8 alu operations, one for each vector element.
+            List of alu operations for elements [offset, offset+count).
+            For multiply_add, returns multiply ops (phase 1) or add ops (phase 2).
         """
         opcode = op[0]
         if opcode == "multiply_add":
             # multiply_add(dest, a, b, c) = a * b + c
-            dest, a, b, c = op[1], op[2], op[3], op[4]
-            # We need a tmp for the multiplication - but we can't easily get one here
-            # For now, skip multiply_add scalarization
+            # Scalarization requires 2 phases and temp storage per group.
+            # With shared temp, concurrent groups would corrupt each other.
+            # Skip for now - let multiply_add use valu slots.
             return None
         elif len(op) == 4:
             # Binary op: (op, dest, src1, src2)
             dest, src1, src2 = op[1], op[2], op[3]
-            return [(opcode, dest + i, src1 + i, src2 + i) for i in range(VLEN)]
+            return [(opcode, dest + i, src1 + i, src2 + i) for i in range(offset, offset + count)]
         return None
 
     def _schedule_group(self, instrs, idx, bundle, allow_phase_advance=True):
@@ -482,22 +489,51 @@ class KernelBuilder:
                 break
 
             limit = SLOT_LIMITS.get(instr.engine, 1)
-            if len(bundle[instr.engine]) < limit:
+            # Don't use valu slot if instruction is partially scalarized - must continue scalarization
+            if len(bundle[instr.engine]) < limit and instr.scalar_offset == 0:
                 bundle[instr.engine].append(instr.op)
                 idx += 1
                 scheduled = True
-            elif instr.engine == "valu" and instr.op[0] in self.SCALARIZABLE_OPS:
+            elif instr.engine == "valu" and (instr.op[0] in self.SCALARIZABLE_OPS or instr.op[0] == "multiply_add"):
                 # Valu slot full - try to scalarize to alu
                 alu_available = SLOT_LIMITS["alu"] - len(bundle["alu"])
-                if alu_available >= VLEN:
-                    # Enough alu slots to scalarize this valu op
-                    scalar_ops = self._scalarize_valu_op(instr.op)
+                # multiply_add needs 2 phases (multiply then add), so 2*VLEN total ops
+                is_muladd = instr.op[0] == "multiply_add"
+                total_ops = 2 * VLEN if is_muladd else VLEN
+                remaining = total_ops - instr.scalar_offset
+
+                # For multiply_add, cap at phase boundary to ensure multiply completes before add
+                if is_muladd and instr.scalar_offset < VLEN:
+                    remaining_in_phase = VLEN - instr.scalar_offset
+                    remaining = min(remaining, remaining_in_phase)
+
+                if alu_available >= remaining:
+                    # Enough slots to finish this phase/instruction
+                    scalar_ops = self._scalarize_valu_op(instr.op, instr.scalar_offset, remaining)
                     if scalar_ops:
                         bundle["alu"].extend(scalar_ops)
-                        idx += 1
+                        new_offset = instr.scalar_offset + len(scalar_ops)
+                        if new_offset >= total_ops:
+                            instr.scalar_offset = 0  # Reset for potential reuse
+                            idx += 1
+                        else:
+                            instr.scalar_offset = new_offset
+                            # Phase complete but instruction not done - break to force new bundle
+                            scheduled = True
+                            break
                         scheduled = True
                         continue
-                break  # Can't scalarize or not enough slots
+                elif alu_available > 0:
+                    # Partial scalarization - use what we have
+                    scalar_ops = self._scalarize_valu_op(instr.op, instr.scalar_offset, alu_available)
+                    if scalar_ops:
+                        bundle["alu"].extend(scalar_ops)
+                        instr.scalar_offset += len(scalar_ops)
+                        scheduled = True
+                        # Don't advance idx - instruction not complete
+                        # But we've used all ALU slots, so break
+                        break
+                break  # No ALU slots available
             else:
                 break  # Slot full for this engine
         return idx, scheduled
@@ -596,8 +632,8 @@ class KernelBuilder:
         bundle_size = SLOT_LIMITS["load"] * VLEN  # 16 elements per cycle
         num_vectors = SLOT_LIMITS["load"]  # 2 vectors
 
-        # Allocate 8 sets of working vectors for pipelining
-        num_concurrent = 8
+        # Allocate N sets of working vectors for pipelining
+        num_concurrent = 9
         scratch_sets = [self._alloc_scratch_vectors_for_set(num_vectors, chr(ord('A') + i))
                         for i in range(num_concurrent)]
         shared = self._alloc_shared_vectors(num_vectors)
