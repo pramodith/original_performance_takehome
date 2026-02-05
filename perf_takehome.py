@@ -231,7 +231,6 @@ class KernelBuilder:
         # Temporary vectors for computation
         s['tmp1'] = [self.alloc_scratch(f"tmp1{sfx}_{j}", VLEN) for j in range(num_vectors)]
         s['tmp2'] = [self.alloc_scratch(f"tmp2{sfx}_{j}", VLEN) for j in range(num_vectors)]
-        s['tmp3'] = [self.alloc_scratch(f"tmp3{sfx}_{j}", VLEN) for j in range(num_vectors)]  # For wrap (separate from branch's tmp1)
         s['idx_plus_1'] = [self.alloc_scratch(f"idx_plus_1{sfx}_{j}", VLEN) for j in range(num_vectors)]
 
         # Scalar addresses for vload/vstore
@@ -381,28 +380,29 @@ class KernelBuilder:
             for v in range(num_vectors):
                 instrs.append(Instruction("valu", ("&", s['tmp1'][v], s['tmp_addr'][v], shared['one_vec']), group, 0, round_num, seq))
                 instrs.append(Instruction("valu", (">>", s['tmp2'][v], s['tmp_addr'][v], shared['one_vec']), group, 0, round_num, seq))
-                instrs.append(Instruction("valu", ("-", s['tmp3'][v], shared['level2_vecs'][1], shared['level2_vecs'][0]), group, 0, round_num, seq))
+                # Use tmp_node_val as scratch (it's only set at the end)
+                instrs.append(Instruction("valu", ("-", s['tmp_node_val'][v], shared['level2_vecs'][1], shared['level2_vecs'][0]), group, 0, round_num, seq))
                 instrs.append(Instruction("valu", ("-", s['idx_plus_1'][v], shared['level2_vecs'][3], shared['level2_vecs'][2]), group, 0, round_num, seq))
             seq += 1
             for v in range(num_vectors):
-                instrs.append(Instruction("valu", ("*", s['tmp_addr'][v], s['tmp3'][v], s['tmp1'][v]), group, 0, round_num, seq))
-                instrs.append(Instruction("valu", ("*", s['tmp3'][v], s['idx_plus_1'][v], s['tmp1'][v]), group, 0, round_num, seq))
+                instrs.append(Instruction("valu", ("*", s['tmp_addr'][v], s['tmp_node_val'][v], s['tmp1'][v]), group, 0, round_num, seq))
+                instrs.append(Instruction("valu", ("*", s['tmp_node_val'][v], s['idx_plus_1'][v], s['tmp1'][v]), group, 0, round_num, seq))
             seq += 1
             for v in range(num_vectors):
                 instrs.append(Instruction("valu", ("+", s['idx_plus_1'][v], shared['level2_vecs'][0], s['tmp_addr'][v]), group, 0, round_num, seq))
-                instrs.append(Instruction("valu", ("+", s['tmp_addr'][v], shared['level2_vecs'][2], s['tmp3'][v]), group, 0, round_num, seq))
+                instrs.append(Instruction("valu", ("+", s['tmp_addr'][v], shared['level2_vecs'][2], s['tmp_node_val'][v]), group, 0, round_num, seq))
             seq += 1
             for v in range(num_vectors):
-                instrs.append(Instruction("valu", ("-", s['tmp3'][v], s['tmp_addr'][v], s['idx_plus_1'][v]), group, 0, round_num, seq))
+                instrs.append(Instruction("valu", ("-", s['tmp_node_val'][v], s['tmp_addr'][v], s['idx_plus_1'][v]), group, 0, round_num, seq))
             seq += 1
             for v in range(num_vectors):
-                instrs.append(Instruction("valu", ("*", s['tmp_addr'][v], s['tmp3'][v], s['tmp2'][v]), group, 0, round_num, seq))
+                instrs.append(Instruction("valu", ("*", s['tmp_addr'][v], s['tmp_node_val'][v], s['tmp2'][v]), group, 0, round_num, seq))
             seq += 1
             for v in range(num_vectors):
                 instrs.append(Instruction("valu", ("+", s['tmp_node_val'][v], s['idx_plus_1'][v], s['tmp_addr'][v]), group, 0, round_num, seq))
             seq += 1
         else:
-            # Rounds 4+: scatter-gather
+            # Levels 3+: scatter-gather
             for v in range(num_vectors):
                 instrs.append(Instruction("valu", ("+", s['tmp_addr'][v], s['tmp_idx'][v], shared['forest_values_p_vec']), group, 0, round_num, seq))
             seq += 1
