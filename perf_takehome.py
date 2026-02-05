@@ -264,9 +264,6 @@ class KernelBuilder:
         s['n_nodes_vec'] = self.alloc_scratch("n_nodes_vec", VLEN)
         s['forest_values_p_vec'] = self.alloc_scratch("forest_values_p_vec", VLEN)
 
-        # Temp storage for multiply_add scalarization
-        self._muladd_temp = self.alloc_scratch("muladd_temp", VLEN)
-
         return s
 
     def _broadcast_constants(self, body, shared, zero_const, one_const, two_const):
@@ -494,33 +491,18 @@ class KernelBuilder:
                 bundle[instr.engine].append(instr.op)
                 idx += 1
                 scheduled = True
-            elif instr.engine == "valu" and (instr.op[0] in self.SCALARIZABLE_OPS or instr.op[0] == "multiply_add"):
+            elif instr.engine == "valu" and instr.op[0] in self.SCALARIZABLE_OPS:
                 # Valu slot full - try to scalarize to alu
                 alu_available = SLOT_LIMITS["alu"] - len(bundle["alu"])
-                # multiply_add needs 2 phases (multiply then add), so 2*VLEN total ops
-                is_muladd = instr.op[0] == "multiply_add"
-                total_ops = 2 * VLEN if is_muladd else VLEN
-                remaining = total_ops - instr.scalar_offset
-
-                # For multiply_add, cap at phase boundary to ensure multiply completes before add
-                if is_muladd and instr.scalar_offset < VLEN:
-                    remaining_in_phase = VLEN - instr.scalar_offset
-                    remaining = min(remaining, remaining_in_phase)
+                remaining = VLEN - instr.scalar_offset
 
                 if alu_available >= remaining:
-                    # Enough slots to finish this phase/instruction
+                    # Enough slots to finish this instruction
                     scalar_ops = self._scalarize_valu_op(instr.op, instr.scalar_offset, remaining)
                     if scalar_ops:
                         bundle["alu"].extend(scalar_ops)
-                        new_offset = instr.scalar_offset + len(scalar_ops)
-                        if new_offset >= total_ops:
-                            instr.scalar_offset = 0  # Reset for potential reuse
-                            idx += 1
-                        else:
-                            instr.scalar_offset = new_offset
-                            # Phase complete but instruction not done - break to force new bundle
-                            scheduled = True
-                            break
+                        instr.scalar_offset = 0  # Reset for potential reuse
+                        idx += 1
                         scheduled = True
                         continue
                 elif alu_available > 0:
@@ -601,6 +583,27 @@ class KernelBuilder:
             alu_ops.append(("+", s['vload_addr_idx'][v], self.scratch["inp_indices_p"], offset_const))
             alu_ops.append(("+", s['vload_addr_val'][v], self.scratch["inp_values_p"], offset_const))
 
+    def _gen_initial_load_instrs(self, s, group, group_start, num_vectors):
+        """Generate initial load instructions for a group (address computation + vloads).
+
+        Uses round=-1 so scheduler can interleave with other groups' compute phases.
+        """
+        instrs = []
+
+        # Phase 0 of round -1: Address computation
+        for v in range(num_vectors):
+            offset = group_start + v * VLEN
+            offset_const = self.scratch_const(offset)
+            instrs.append(Instruction("alu", ("+", s['vload_addr_idx'][v], self.scratch["inp_indices_p"], offset_const), group, 0, -1, 0))
+            instrs.append(Instruction("alu", ("+", s['vload_addr_val'][v], self.scratch["inp_values_p"], offset_const), group, 0, -1, 0))
+
+        # Phase 1 of round -1: Vector loads (must come after address computation)
+        for v in range(num_vectors):
+            instrs.append(Instruction("load", ("vload", s['tmp_idx'][v], s['vload_addr_idx'][v]), group, 1, -1, 0))
+            instrs.append(Instruction("load", ("vload", s['tmp_val'][v], s['vload_addr_val'][v]), group, 1, -1, 0))
+
+        return instrs
+
     def _emit_group_loads(self, body, s, num_vectors):
         """Emit load bundles for idx and val vectors.
 
@@ -655,24 +658,13 @@ class KernelBuilder:
                     group_items = list(range(group_start, min(group_start + bundle_size, batch_size)))
                     active_groups.append((s, group_start, group_items, chr(ord('A') + offset)))
 
-            # Compute addresses for all active groups (respecting ALU slot limit of 12)
-            alu_ops = []
-            for s, group_start, group_items, name in active_groups:
-                self._compute_load_addresses(alu_ops, s, group_start, num_vectors)
-                if len(alu_ops) >= SLOT_LIMITS["alu"]:
-                    body.append(("bundle", {"alu": alu_ops[:SLOT_LIMITS["alu"]]}))
-                    alu_ops = alu_ops[SLOT_LIMITS["alu"]:]
-            if alu_ops:
-                body.append(("bundle", {"alu": alu_ops}))
-
-            # Load idx and val for all active groups
-            for s, group_start, group_items, name in active_groups:
-                self._emit_group_loads(body, s, num_vectors)
-
-            # Generate instructions for all active groups across all rounds
+            # Generate instructions for all active groups including initial loads
             instr_lists = []
             for s, group_start, group_items, name in active_groups:
                 instrs = []
+                # Add initial load instructions (round -1)
+                instrs.extend(self._gen_initial_load_instrs(s, name, group_start, num_vectors))
+                # Add round instructions
                 for round_num in range(rounds):
                     instrs.extend(self._gen_round_instrs(s, shared, name, round_num, num_vectors, group_items))
                 instr_lists.append(instrs)
