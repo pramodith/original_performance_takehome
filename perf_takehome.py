@@ -486,13 +486,10 @@ class KernelBuilder:
         """Generate wrap instructions for one group's round.
 
         Wrap logic: idx = (idx < n_nodes) ? idx : 0
-        Optimized to avoid vselect (flow op, limit 1) using multiply:
-          idx = idx * (idx < n_nodes)
-        Compare returns 1 if true, 0 if false, so this zeros idx when >= n_nodes.
 
-        Special case: At the leaf level (level == forest_height), wrap ALWAYS
-        happens because branching from leaves always exceeds n_nodes. We can
-        skip the compare and just set idx = 0 using XOR with itself.
+        Optimization: For a perfect binary tree, wrap only happens at the leaf level.
+        - Levels 0 to forest_height-1: idx is always < n_nodes, no wrap needed
+        - Level forest_height (leaves): after branch, idx always >= n_nodes, set idx = 0
         """
         instrs = []
 
@@ -503,15 +500,7 @@ class KernelBuilder:
             # Using idx ^ idx = 0 (XOR with itself)
             for v in range(num_vectors):
                 instrs.append(Instruction("valu", ("^", s['tmp_idx'][v], s['tmp_idx'][v], s['tmp_idx'][v]), group, 3, round_num, 0))
-        else:
-            # Normal wrap: idx = idx * (idx < n_nodes)
-            # tmp3 = idx < n_nodes (returns 1 if true, 0 if false)
-            for v in range(num_vectors):
-                instrs.append(Instruction("valu", ("<", s['tmp3'][v], s['tmp_idx'][v], shared['n_nodes_vec']), group, 3, round_num, 0))
-
-            # idx = idx * tmp3 (zeros idx if it was >= n_nodes)
-            for v in range(num_vectors):
-                instrs.append(Instruction("valu", ("*", s['tmp_idx'][v], s['tmp_idx'][v], s['tmp3'][v]), group, 3, round_num, 1))
+        # else: No wrap needed - idx is always valid at non-leaf levels
 
         # Debug compares
         for j, i in enumerate(group_items):
