@@ -265,7 +265,9 @@ class KernelBuilder:
         s['n_nodes_vec'] = self.alloc_scratch("n_nodes_vec", VLEN)
         s['forest_values_p_vec'] = self.alloc_scratch("forest_values_p_vec", VLEN)
 
-        # Level-based tree value preloading for rounds 1-3
+        # Level-based tree value preloading for rounds 0-3
+        s['level0_scalar'] = self.alloc_scratch("tree_l0")  # tree[0] = root
+        s['level0_vec'] = self.alloc_scratch("tree_l0_vec", VLEN)
         s['level1_scalars'] = [self.alloc_scratch(f"tree_l1_{i}") for i in range(2)]
         s['level2_scalars'] = [self.alloc_scratch(f"tree_l2_{i}") for i in range(4)]
         s['level3_scalars'] = [self.alloc_scratch(f"tree_l3_{i}") for i in range(8)]
@@ -306,8 +308,11 @@ class KernelBuilder:
         if valu_ops:
             body.append(("bundle", {"valu": valu_ops}))
 
-        # Preload tree values for levels 1-3
+        # Preload tree values for levels 0-3
         tmp_addr = [self.alloc_scratch(f"tmp_tree_addr_{i}") for i in range(2)]
+        # Level 0: tree[0] (root)
+        body.append(("bundle", {"load": [("load", shared['level0_scalar'], self.scratch["forest_values_p"])]}))
+        # Levels 1-3: tree[1-14]
         all_indices = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         all_scalars = shared['level1_scalars'] + shared['level2_scalars'] + shared['level3_scalars']
         for i in range(0, len(all_indices), 2):
@@ -318,11 +323,14 @@ class KernelBuilder:
 
         # Broadcast preloaded values to vectors
         valu_ops = []
+        valu_ops.append(("vbroadcast", shared['level0_vec'], shared['level0_scalar']))
         for i in range(2):
             valu_ops.append(("vbroadcast", shared['level1_vecs'][i], shared['level1_scalars'][i]))
-        for i in range(4):
+        for i in range(3):  # First 3 of level2
             valu_ops.append(("vbroadcast", shared['level2_vecs'][i], shared['level2_scalars'][i]))
         body.append(("bundle", {"valu": valu_ops}))
+        # Remaining level2 broadcast
+        body.append(("bundle", {"valu": [("vbroadcast", shared['level2_vecs'][3], shared['level2_scalars'][3])]}))
         valu_ops = []
         for i in range(8):
             valu_ops.append(("vbroadcast", shared['level3_vecs'][i], shared['level3_scalars'][i]))
@@ -343,10 +351,14 @@ class KernelBuilder:
         level = round_num % (self.forest_height + 1)
 
         if level == 0:
-            # Round 0: load root and broadcast
-            instrs.append(Instruction("load", ("load", s['tmp_addr'][0], self.scratch["forest_values_p"]), group, 0, round_num, seq)); seq += 1
+            # Level 0: use preloaded root value (level0_vec)
+            # Copy level0_vec to tmp_node_val using: tmp_node_val = level0_vec + 0
+            # Compute zero vector: tmp1[0] = one_vec ^ one_vec = 0
+            instrs.append(Instruction("valu", ("^", s['tmp1'][0], shared['one_vec'], shared['one_vec']), group, 0, round_num, seq))
+            seq += 1
+            # Copy: tmp_node_val = level0_vec + 0
             for v in range(num_vectors):
-                instrs.append(Instruction("valu", ("vbroadcast", s['tmp_node_val'][v], s['tmp_addr'][0]), group, 0, round_num, seq))
+                instrs.append(Instruction("valu", ("+", s['tmp_node_val'][v], shared['level0_vec'], s['tmp1'][0]), group, 0, round_num, seq))
             seq += 1
         elif level == 1:
             # Round 1: idx is 1 or 2, use 2-way select
@@ -477,16 +489,29 @@ class KernelBuilder:
         Optimized to avoid vselect (flow op, limit 1) using multiply:
           idx = idx * (idx < n_nodes)
         Compare returns 1 if true, 0 if false, so this zeros idx when >= n_nodes.
+
+        Special case: At the leaf level (level == forest_height), wrap ALWAYS
+        happens because branching from leaves always exceeds n_nodes. We can
+        skip the compare and just set idx = 0 using XOR with itself.
         """
         instrs = []
 
-        # tmp3 = idx < n_nodes (returns 1 if true, 0 if false)
-        for v in range(num_vectors):
-            instrs.append(Instruction("valu", ("<", s['tmp3'][v], s['tmp_idx'][v], shared['n_nodes_vec']), group, 3, round_num, 0))
+        level = round_num % (self.forest_height + 1)
 
-        # idx = idx * tmp3 (zeros idx if it was >= n_nodes)
-        for v in range(num_vectors):
-            instrs.append(Instruction("valu", ("*", s['tmp_idx'][v], s['tmp_idx'][v], s['tmp3'][v]), group, 3, round_num, 1))
+        if level == self.forest_height:
+            # At leaf level, wrap always happens - just set idx = 0
+            # Using idx ^ idx = 0 (XOR with itself)
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("^", s['tmp_idx'][v], s['tmp_idx'][v], s['tmp_idx'][v]), group, 3, round_num, 0))
+        else:
+            # Normal wrap: idx = idx * (idx < n_nodes)
+            # tmp3 = idx < n_nodes (returns 1 if true, 0 if false)
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("<", s['tmp3'][v], s['tmp_idx'][v], shared['n_nodes_vec']), group, 3, round_num, 0))
+
+            # idx = idx * tmp3 (zeros idx if it was >= n_nodes)
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("*", s['tmp_idx'][v], s['tmp_idx'][v], s['tmp3'][v]), group, 3, round_num, 1))
 
         # Debug compares
         for j, i in enumerate(group_items):
