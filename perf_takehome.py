@@ -463,20 +463,27 @@ class KernelBuilder:
         """Generate branch instructions for one group's round."""
         instrs = []
 
-        # Optimized branch: idx = 2*idx + 1 + (val%2)
-        # This eliminates the vselect entirely!
-        # Original: idx = vselect(val%2, 2*idx+2, 2*idx+1)
-        # When val%2=1: 2*idx+2. When val%2=0: 2*idx+1
-        # So: 2*idx + 1 + (val&1)  [val&1 is equivalent to val%2 for non-negative integers]
-        for v in range(num_vectors):
-            # tmp1 = val & 1 (same as val % 2)
-            instrs.append(Instruction("valu", ("&", s['tmp1'][v], s['tmp_val'][v], shared['one_vec']), group, 2, round_num, 0))
-            # idx_plus_1 = 2*idx + 1
-            instrs.append(Instruction("valu", ("multiply_add", s['idx_plus_1'][v], s['tmp_idx'][v], shared['two_vec'], shared['one_vec']), group, 2, round_num, 0))
+        level = round_num % (self.forest_height + 1)
 
-        # idx = idx_plus_1 + tmp1 (this is 2*idx + 1 + (val%2))
-        for v in range(num_vectors):
-            instrs.append(Instruction("valu", ("+", s['tmp_idx'][v], s['idx_plus_1'][v], s['tmp1'][v]), group, 2, round_num, 1))
+        if level == 0:
+            # At level 0, idx is always 0 (from init or wrap), so 2*idx+1 = 1 = one_vec
+            # Replace multiply_add with simpler scalarizable op: idx_plus_1 = one_vec | one_vec
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("&", s['tmp1'][v], s['tmp_val'][v], shared['one_vec']), group, 2, round_num, 0))
+                instrs.append(Instruction("valu", ("|", s['idx_plus_1'][v], shared['one_vec'], shared['one_vec']), group, 2, round_num, 0))
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("+", s['tmp_idx'][v], s['idx_plus_1'][v], s['tmp1'][v]), group, 2, round_num, 1))
+        else:
+            # General case: idx = 2*idx + 1 + (val%2)
+            for v in range(num_vectors):
+                # tmp1 = val & 1 (same as val % 2)
+                instrs.append(Instruction("valu", ("&", s['tmp1'][v], s['tmp_val'][v], shared['one_vec']), group, 2, round_num, 0))
+                # idx_plus_1 = 2*idx + 1
+                instrs.append(Instruction("valu", ("multiply_add", s['idx_plus_1'][v], s['tmp_idx'][v], shared['two_vec'], shared['one_vec']), group, 2, round_num, 0))
+
+            # idx = idx_plus_1 + tmp1 (this is 2*idx + 1 + (val%2))
+            for v in range(num_vectors):
+                instrs.append(Instruction("valu", ("+", s['tmp_idx'][v], s['idx_plus_1'][v], s['tmp1'][v]), group, 2, round_num, 1))
 
         # Debug compares
         for j, i in enumerate(group_items):
