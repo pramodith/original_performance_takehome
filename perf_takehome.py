@@ -199,15 +199,20 @@ class KernelBuilder:
 
     def _init_memory_vars(self):
         """Load initial variables from memory header into scratch space."""
+        # Memory layout: [rounds, n_nodes, batch_size, forest_height, forest_values_p, inp_indices_p, inp_values_p]
+        # Skip n_nodes (index 1) and forest_height (index 3) as they're unused at runtime
         init_vars = [
-            "rounds", "n_nodes", "batch_size", "forest_height",
-            "forest_values_p", "inp_indices_p", "inp_values_p",
+            ("rounds", 0),
+            ("batch_size", 2),
+            ("forest_values_p", 4),
+            ("inp_indices_p", 5),
+            ("inp_values_p", 6),
         ]
-        for v in init_vars:
+        for v, _ in init_vars:
             self.alloc_scratch(v, 1)
         tmp_init = self.alloc_scratch("tmp_init")
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp_init, i))
+        for v, mem_idx in init_vars:
+            self.add("load", ("const", tmp_init, mem_idx))
             self.add("load", ("load", self.scratch[v], tmp_init))
 
     def _alloc_scratch_vectors_for_set(self, num_vectors, set_id):
@@ -261,7 +266,6 @@ class KernelBuilder:
         # Constant vectors for branch computation
         s['two_vec'] = self.alloc_scratch("two_vec", VLEN)
         s['one_vec'] = self.alloc_scratch("one_vec", VLEN)
-        s['n_nodes_vec'] = self.alloc_scratch("n_nodes_vec", VLEN)
         s['forest_values_p_vec'] = self.alloc_scratch("forest_values_p_vec", VLEN)
 
         # Level-based tree value preloading for rounds 0-3
@@ -286,7 +290,6 @@ class KernelBuilder:
         body.append(("bundle", {"valu": [
             ("vbroadcast", shared['two_vec'], two_const),
             ("vbroadcast", shared['one_vec'], one_const),
-            ("vbroadcast", shared['n_nodes_vec'], self.scratch["n_nodes"]),
             ("vbroadcast", shared['forest_values_p_vec'], self.scratch["forest_values_p"]),
             ("vbroadcast", shared['three_vec'], three_const),
             ("vbroadcast", shared['seven_vec'], seven_const),
