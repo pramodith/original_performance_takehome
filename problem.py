@@ -643,6 +643,35 @@ def reference_kernel(t: Tree, inp: Input):
             inp.indices[i] = idx
 
 
+def reference_kernel_3(t: Tree, inp: Input):
+    """Reference implementation with swapped loops.
+
+    Processes each item through all rounds before moving to the next item.
+    This is equivalent to reference_kernel but with loops swapped:
+    - Outer loop: iterate over items
+    - Inner loop: iterate over rounds
+
+    A parallel tree traversal where at each node we set
+    cur_inp_val = myhash(cur_inp_val ^ node_val)
+    and then choose the left branch if cur_inp_val is even.
+    If we reach the bottom of the tree we wrap around to the top.
+
+    Args:
+        t: The tree to traverse.
+        inp: The input containing indices, values, and round count.
+            Modified in place with final indices and values.
+    """
+    for i in range(len(inp.indices)):
+        idx = inp.indices[i]
+        val = inp.values[i]
+        for h in range(inp.rounds):
+            val = myhash(val ^ t.values[idx])
+            idx = 2 * idx + (1 if val % 2 == 0 else 2)
+            idx = 0 if idx >= len(t.values) else idx
+        inp.values[i] = val
+        inp.indices[i] = idx
+
+
 def build_mem_image(t: Tree, inp: Input) -> list[int]:
     """Build a flat memory image of the problem.
 
